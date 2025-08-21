@@ -162,6 +162,27 @@ class AttentionMetadata:
             for field in fields(self) if field.name not in skip_fields
         }
 
+@dataclass
+class MLAPreprocessResults:
+    """Results of MLAPreprocess.
+    """
+    q: Optional[torch.Tensor]
+    k_c_normed: Optional[torch.Tensor]
+    k_pe: Optional[torch.Tensor]
+    
+@dataclass
+class MLAPreprocessModules:
+    """Modules used in MLAPreprocess.
+    """
+    fused_qkv_a_proj: Optional[torch.nn.Module]
+    kv_a_proj_with_mqa: Optional[torch.nn.Module]
+    q_a_layernorm: Optional[torch.nn.Module]
+    q_b_proj: Optional[torch.nn.Module]
+    q_proj: Optional[torch.nn.Module]
+    kv_a_layernorm: Optional[torch.nn.Module]
+    kv_b_proj: Optional[torch.nn.Module]
+    rotary_emb: Optional[torch.nn.Module]
+
 
 T = TypeVar("T", bound=AttentionMetadata)
 
@@ -310,9 +331,7 @@ class MLAAttentionImpl(AttentionImpl[T], Generic[T]):
     def forward(
         self,
         layer: AttentionLayer,
-        hidden_states_or_cq: torch.Tensor,
-        kv_c_normed: torch.Tensor,
-        k_pe: torch.Tensor,
+        mla_preprocess_results: MLAPreprocessResults,
         kv_cache: torch.Tensor,
         attn_metadata: T,
         output: Optional[torch.Tensor] = None,

@@ -37,6 +37,8 @@ from vllm.config import (CacheConfig, ModelConfig, VllmConfig,
                          get_current_vllm_config)
 from vllm.distributed import (get_ep_group, get_pp_group,
                               get_tensor_model_parallel_world_size)
+from vllm.attention.backends.abstract import MLAPreprocessModules
+from vllm.v1.attention.backends.mla.common import MLACommonPreprocessor
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -466,6 +468,27 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
+        mla_po_modules = MLAPreprocessModules(
+            fused_qkv_a_proj= self.fused_qkv_a_proj if self.q_lora_rank is not None else None,
+            kv_a_proj_with_mqa= self.kv_a_proj_with_mqa if self.q_lora_rank is None else None,
+            q_a_layernorm= self.q_a_layernorm if self.q_lora_rank is not None else None,
+            q_b_proj= self.q_b_proj if self.q_lora_rank is not None else None,
+            q_proj= self.q_proj if self.q_lora_rank is None else None,
+            kv_a_layernorm= self.kv_a_layernorm,
+            kv_b_proj= self.kv_b_proj,
+            rotary_emb= self.rotary_emb,
+        )
+        self.mla_po = MLACommonPreprocessor(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_local_heads,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=self.v_head_dim,
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            mla_po_modules=mla_po_modules,
+        )
+
         # In the MLA backend, kv_cache includes both k_c and
         # pe (i.e. decoupled position embeddings). In particular,
         # the concat_and_cache_mla op requires
@@ -499,31 +522,10 @@ class DeepseekV2MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        q_c = None
-        kv_lora = None
-
-        if self.q_lora_rank is not None:
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            q_c, kv_lora = qkv_lora.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
-        else:
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-            q = self.q_proj(hidden_states)[0]
-
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim],
-                                   dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
-
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        # Add head dim of 1 to k_pe
-        k_pe = k_pe.unsqueeze(1)
-
-        q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim:], k_pe)
+        mla_po_results = self.mla_po(
+            positions=positions,
+            hidden_states=hidden_states,
+        )
 
         attn_out = self.mla_attn(
             q,

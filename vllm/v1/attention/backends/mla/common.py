@@ -196,9 +196,12 @@ import torch
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.model_executor.custom_op import CustomOp
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionLayer,
                                               AttentionMetadata,
-                                              MLAAttentionImpl)
+                                              MLAAttentionImpl,
+                                              MLAPreprocessResults,
+                                              MLAPreprocessModules)
 from vllm.attention.backends.utils import get_mla_dims
 from vllm.attention.ops.merge_attn_states import merge_attn_states
 from vllm.attention.utils.fa_utils import get_flash_attn_version
@@ -728,6 +731,79 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         return attn_metadata
 
+class MLACommonPreprocessor(CustomOp):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        q_lora_rank: Optional[int],
+        kv_lora_rank: int,
+        mla_po_modules: MLAPreprocessModules,
+    ) -> None:
+        self.hidden_size = hidden_size
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.num_heads = num_heads
+        self.fused_qkv_a_proj = mla_po_modules.fused_qkv_a_proj
+        self.kv_a_proj_with_mqa = mla_po_modules.kv_a_proj_with_mqa
+        self.q_a_layernorm = mla_po_modules.q_a_layernorm
+        self.q_b_proj = mla_po_modules.q_b_proj
+        self.q_proj = mla_po_modules.q_proj
+        self.kv_a_layernorm = mla_po_modules.kv_a_layernorm
+        self.kv_b_proj = mla_po_modules.kv_b_proj
+        self.rotary_emb = mla_po_modules.rotary_emb
+
+    def forward_native(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> MLAPreprocessResults:
+        q_c = None
+        kv_lora = None
+
+        if self.q_lora_rank is not None:
+            assert self.fused_qkv_a_proj is not None
+            assert self.q_a_layernorm is not None
+            assert self.q_b_proj is not None
+            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            q_c, kv_lora = qkv_lora.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
+            )
+            q_c = self.q_a_layernorm(q_c)
+            q = self.q_b_proj(q_c)[0]
+        else:
+            assert self.kv_a_proj_with_mqa is not None
+            assert self.q_proj is not None
+            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+            q = self.q_proj(hidden_states)[0]
+
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim],
+                                   dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        # Add head dim of 1 to k_pe
+        k_pe = k_pe.unsqueeze(1)
+
+        q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
+            positions, q[..., self.qk_nope_head_dim:], k_pe)
+        mla_preprocess_results = MLAPreprocessResults(
+            q=q,
+            kv_c=kv_c_normed,
+            k_pe=k_pe,
+        )
+        return mla_preprocess_results
+    
+    def forward_cuda(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
 
 class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
     """
@@ -1129,9 +1205,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
     def forward(
         self,
         layer: AttentionLayer,
-        q: torch.Tensor,
-        k_c_normed: torch.Tensor,  # key in unified attn
-        k_pe: torch.Tensor,  # value in unified attn
+        mla_preprocess_results: MLAPreprocessResults,
         kv_cache: torch.Tensor,
         attn_metadata: M,
         output: Optional[torch.Tensor] = None,
@@ -1150,6 +1224,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             # same expert outputs.
             return output.fill_(0)
 
+        q = mla_preprocess_results.q
+        k_c_normed = mla_preprocess_results.k_c_normed
+        k_pe = mla_preprocess_results.k_pe
         num_actual_toks = attn_metadata.num_actual_tokens
 
         # Inputs and outputs may be padded for CUDA graphs

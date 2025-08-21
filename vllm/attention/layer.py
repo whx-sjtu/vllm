@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.attention import AttentionType
-from vllm.attention.backends.abstract import AttentionBackend
+from vllm.attention.backends.abstract import AttentionBackend, MLAPreprocessResults
 from vllm.attention.selector import backend_name_to_enum, get_attn_backend
 from vllm.attention.utils.kv_sharing_utils import validate_kv_sharing_target
 from vllm.config import CacheConfig, get_current_vllm_config
@@ -326,6 +326,66 @@ class Attention(nn.Module):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
+
+class MultiHeadLatentAttention(Attention):
+    """Multi-headed latent attention"""
+
+    def forward(
+        self,
+        mla_preprocess_results: MLAPreprocessResults,
+        output_shape: Optional[torch.Size] = None,
+    ) -> torch.Tensor:
+        """Input shape: batch_size x seq_len x hidden_size"""
+        """
+        The KV cache is stored inside this class and is accessed via
+        `self.kv_cache`.
+
+        Attention metadata (`attn_metadata`) is set using a context manager in
+        the model runner's `execute_model` method. It is accessed via forward
+        context using
+        `vllm.forward_context.get_forward_context().attn_metadata`.
+        """
+        assert self.use_mla
+        if self.calculate_kv_scales:
+            attn_metadata = get_forward_context().attn_metadata
+            if attn_metadata.enable_kv_scales_calculation:
+                self.calc_kv_scales(query, key, value)
+        if self.use_output:
+            output_shape = (output_shape
+                            if output_shape is not None else query.shape)
+            output = torch.zeros(output_shape,
+                                 dtype=query.dtype,
+                                 device=query.device)
+            hidden_size = output_shape[-1]
+            if self.use_direct_call:
+                forward_context: ForwardContext = get_forward_context()
+                attn_metadata = forward_context.attn_metadata
+                if isinstance(attn_metadata, dict):
+                    attn_metadata = attn_metadata[self.layer_name]
+                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                self.impl.forward(self,
+                                  query,
+                                  key,
+                                  value,
+                                  self_kv_cache,
+                                  attn_metadata,
+                                  output=output)
+            else:
+                torch.ops.vllm.unified_attention_with_output(
+                    query, key, value, output, self.layer_name)
+            return output.view(-1, hidden_size)
+        else:
+            if self.use_direct_call:
+                forward_context = get_forward_context()
+                attn_metadata = forward_context.attn_metadata
+                if isinstance(attn_metadata, dict):
+                    attn_metadata = attn_metadata[self.layer_name]
+                self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                return self.impl.forward(self, query, key, value,
+                                         self_kv_cache, attn_metadata)
+            else:
+                return torch.ops.vllm.unified_attention(
+                    query, key, value, self.layer_name)
 
 
 class MultiHeadAttention(nn.Module):
