@@ -119,23 +119,23 @@ class ParserManager:
         Returns:
             A Parser class, or None if neither parser is specified.
         """
-        if not tool_parser_name and not reasoning_parser_name:
-            return None
-
         reasoning_parser_cls = cls.get_reasoning_parser(reasoning_parser_name)
         tool_parser_cls = cls.get_tool_parser(
             tool_parser_name, enable_auto_tools, model_name
         )
 
-        if reasoning_parser_cls is None and tool_parser_cls is None:
-            return None
-
+        # Harmony is the model's native output format, not something the user
+        # opts into, so it must be parsed even when no reasoning/tool parser is
+        # configured. HarmonyParser handles both delegates being None.
         if is_harmony:
             from vllm.parser.harmony import HarmonyParser
 
             HarmonyParser.reasoning_parser_cls = reasoning_parser_cls
             HarmonyParser.tool_parser_cls = tool_parser_cls
             return HarmonyParser
+
+        if reasoning_parser_cls is None and tool_parser_cls is None:
+            return None
 
         reasoning_engine_cls = cls._get_parser_engine_cls(reasoning_parser_cls)
         tool_engine_cls = cls._get_parser_engine_cls(tool_parser_cls)
