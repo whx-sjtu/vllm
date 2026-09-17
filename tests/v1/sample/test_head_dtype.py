@@ -211,6 +211,54 @@ def test_get_top_tokens_honors_head_dtype(default_vllm_config):
     assert torch.equal(top, expected)
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_get_top_tokens_tp_preserves_padding_and_processing(
+    default_vllm_config, monkeypatch, device, dtype
+):
+    """Packed TP candidates preserve processed-logit ties and exclude padding."""
+    from types import SimpleNamespace
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("Requires CUDA or ROCm")
+    lp = LogitsProcessor(15, soft_cap=2.0, scale=0.5)
+    lp.head_dtype = dtype
+    hidden = torch.ones(3, 8, dtype=dtype, device=device)
+    weights = torch.zeros(16, 8, dtype=dtype, device=device)
+    weights[3, 0] = 1
+    weights[10, 0] = 2
+    weights[15, 0] = 100  # Padding would win without the mask.
+    hidden[1, 0] = -1
+    hidden[2, 0] = 0  # All valid logits tie across ranks.
+    lm_head = _FakeLmHead(
+        weights[8:],
+        shard_indices=SimpleNamespace(num_org_vocab_padding=1, org_vocab_start_index=8),
+    )
+    lm_head.tp_size = 2
+    # Exercise the CPU fallback even when the platform's GEMM dispatch is GPU-only.
+    monkeypatch.setattr(
+        lm_head.quant_method,
+        "apply",
+        lambda layer, x, bias=None: torch.nn.functional.linear(x, layer.weight, bias),
+    )
+    full_logits = torch.nn.functional.linear(hidden, weights)
+    full_logits = torch.tanh(full_logits / lp.soft_cap) * lp.soft_cap * lp.scale
+    full_logits[:, -1] = -float("inf")
+    remote_values, remote_indices = full_logits[:, :8].max(dim=-1)
+    remote_pair = torch.stack((remote_values.float(), remote_indices.float()), dim=-1)
+
+    def gather_candidates(local_pair, dim):
+        return torch.cat((remote_pair, local_pair), dim=dim)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.logits_processor.tensor_model_parallel_all_gather",
+        gather_candidates,
+    )
+    actual = lp.get_top_tokens(lm_head, hidden)
+    assert actual.dtype == torch.int64
+    torch.testing.assert_close(actual, full_logits.argmax(dim=-1))
+
+
 @pytest.mark.core_model
 def test_fp32_head_e2e_no_nan():
     """An fp32 head produces finite logprobs end-to-end.

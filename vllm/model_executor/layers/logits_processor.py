@@ -228,20 +228,26 @@ class LogitsProcessor(PluggableLayer):
         if num_pad > 0:
             logits[..., -num_pad:] = -float("inf")
 
-        local_max_vals, local_max_indices = logits.max(dim=-1)
-
-        # Convert shard-local indices to global vocab indices.
         vocab_start = lm_head.shard_indices.org_vocab_start_index
-        global_indices = local_max_indices + vocab_start
-
         if tp_size == 1:
-            return global_indices
+            return logits.max(dim=-1).indices + vocab_start
 
         # All-gather (value, index) pairs, then reduce to global argmax.
         # Use float32 to avoid bf16 precision loss on large vocab indices.
-        local_pair = torch.stack(
-            [local_max_vals.float(), global_indices.float()], dim=-1
-        )
+        if logits.is_cuda and logits.dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            from vllm.model_executor.layers.fused_argmax import argmax_and_pack
+
+            local_pair = argmax_and_pack(logits, vocab_start)
+        else:
+            local_max_vals, local_max_indices = logits.max(dim=-1)
+            global_indices = local_max_indices + vocab_start
+            local_pair = torch.stack(
+                [local_max_vals.float(), global_indices.float()], dim=-1
+            )
         # [batch, 2] -> [batch, 2 * tp_size]
         gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
         # [batch, tp_size, 2] where [:, :, 0]=values, [:, :, 1]=indices
