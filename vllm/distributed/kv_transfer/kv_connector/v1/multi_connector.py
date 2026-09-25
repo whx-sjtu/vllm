@@ -9,6 +9,7 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.kv_transfer import KVTransferConfig
+from vllm.distributed import get_world_group
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -45,12 +46,12 @@ logger = init_logger(__name__)
 @dataclass
 class MultiKVConnectorMetadata(KVConnectorMetadata):
     metadata: tuple[KVConnectorMetadata, ...]
-    extra_async_saves: dict[str, int] | None = None
 
 
 @dataclass
 class MultiKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
     metadata: tuple[KVConnectorWorkerMetadata | None, ...]
+    finished_sending: tuple[dict[str, set[int]], ...] = ()
 
     def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
         assert isinstance(other, MultiKVConnectorWorkerMetadata)
@@ -65,7 +66,18 @@ class MultiKVConnectorWorkerMetadata(KVConnectorWorkerMetadata):
             else:
                 metadata_list.append(metadata1.aggregate(metadata2))
 
-        return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))
+        finished_sending = []
+        for i in range(len(self.metadata)):
+            merged: dict[str, set[int]] = {}
+            for source in (self.finished_sending, other.finished_sending):
+                if source:
+                    for req_id, ranks in source[i].items():
+                        merged.setdefault(req_id, set()).update(ranks)
+            finished_sending.append(merged)
+        return MultiKVConnectorWorkerMetadata(
+            metadata=tuple(metadata_list),
+            finished_sending=tuple(finished_sending),
+        )
 
 
 @dataclass
@@ -202,11 +214,17 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         # load the request from (if any).
         self._requests_to_connector: dict[str, int] = {}
 
-        # Keeps track of *additional* remaining async saves (beyond 1) to be
-        # finished per request. Not needed for async loads since we only allow
-        # a single connector to load.
-        # Propagated from scheduler to worker side via the connector metadata.
-        self._extra_async_saves: dict[str, int] = {}
+        # Scheduler-side owners and completions, including ACKs before finish.
+        self._async_save_owners: dict[str, set[int]] = {}
+        self._completed_async_saves: dict[str, set[int]] = {}
+        self._send_workers: tuple[dict[str, set[int]], ...] = tuple(
+            {} for _ in self._connectors
+        )
+        self._world_size = vllm_config.parallel_config.world_size
+        # Worker-side notifications drained into the worker metadata each step.
+        self._worker_finished_sending: tuple[dict[str, set[int]], ...] = tuple(
+            {} for _ in self._connectors
+        )
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
@@ -261,8 +279,6 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     # always return False.
     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
         assert isinstance(connector_metadata, MultiKVConnectorMetadata)
-        if connector_metadata.extra_async_saves:
-            self._extra_async_saves.update(connector_metadata.extra_async_saves)
         for c, cm in zip(self._connectors, connector_metadata.metadata):
             c.bind_connector_metadata(cm)
         super().bind_connector_metadata(connector_metadata)
@@ -313,29 +329,20 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
-        finished_sending: set[str] = set()
         finished_recving: set[str] = set()
-        for c in self._connectors:
+        for i, c in enumerate(self._connectors):
             sending, recving = c.get_finished(finished_req_ids)
             if not recving and not sending:
                 continue
             # Aggregate finished recving request ids.
             finished_recving.update(recving or ())
-            # Aggregate finished sending request ids - only include
-            # once we've drained the "extra" count (for cases where
-            # more than one connector is async-saving the same request).
+            # Preserve the child and rank until scheduler-side ACK processing.
             for req_id in sending or ():
-                extra_pending = self._extra_async_saves.get(req_id)
-                if extra_pending is None:
-                    finished_sending.add(req_id)
-                    continue
-                assert extra_pending > 0
-                if extra_pending == 1:
-                    del self._extra_async_saves[req_id]
-                else:
-                    self._extra_async_saves[req_id] = extra_pending - 1
+                self._worker_finished_sending[i].setdefault(req_id, set()).add(
+                    get_world_group().rank
+                )
 
-        return finished_sending or None, finished_recving or None
+        return None, finished_recving or None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         agg_block_ids: set[int] = set()
@@ -369,16 +376,14 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         return next(iter(counts), None)
 
     def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
-        metadata_list: list[KVConnectorWorkerMetadata | None] | None = None
-        for i, c in enumerate(self._connectors):
-            kv_connector_worker_meta = c.build_connector_worker_meta()
-            if metadata_list is None and kv_connector_worker_meta is not None:
-                metadata_list = [None] * i
-            if metadata_list is not None:
-                metadata_list.append(kv_connector_worker_meta)
-        if metadata_list is None:
+        metadata = tuple(c.build_connector_worker_meta() for c in self._connectors)
+        finished_sending = self._worker_finished_sending
+        self._worker_finished_sending = tuple({} for _ in self._connectors)
+        if all(item is None for item in metadata) and not any(finished_sending):
             return None
-        return MultiKVConnectorWorkerMetadata(metadata=tuple(metadata_list))
+        return MultiKVConnectorWorkerMetadata(
+            metadata=metadata, finished_sending=finished_sending
+        )
 
     # TODO: Add a generic implementation of 'get_kv_connector_kv_cache_events'
     # method for the MultiConnector. It should be able to get events from
@@ -423,21 +428,24 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 c.update_state_after_alloc(request, blocks, 0)
 
     def on_new_request(self, request: "Request") -> None:
+        self._completed_async_saves[request.request_id] = set()
         for c in self._connectors:
             c.on_new_request(request)
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> MultiKVConnectorMetadata:
-        metadata = MultiKVConnectorMetadata(
+        return MultiKVConnectorMetadata(
             metadata=tuple(
                 c.build_connector_meta(scheduler_output) for c in self._connectors
             )
         )
-        if self._extra_async_saves:
-            metadata.extra_async_saves = self._extra_async_saves
-            self._extra_async_saves = {}
-        return metadata
+
+    def _forget_async_saves(self, req_id: str) -> None:
+        self._async_save_owners.pop(req_id, None)
+        self._completed_async_saves.pop(req_id, None)
+        for workers in self._send_workers:
+            workers.pop(req_id, None)
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         multi_connector_worker_meta: MultiKVConnectorWorkerMetadata | None = None
@@ -448,6 +456,8 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             )
             multi_connector_worker_meta = connector_output.kv_connector_worker_meta
 
+        incoming_sending = set(connector_output.finished_sending or ())
+        finished_sending: set[str] = set()
         try:
             for i, c in enumerate(self._connectors):
                 if multi_connector_worker_meta is not None:
@@ -455,10 +465,60 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                     connector_output.kv_connector_worker_meta = (
                         multi_connector_worker_meta.metadata[i]
                     )
+                child_sending: set[str] = set()
+                if (
+                    multi_connector_worker_meta
+                    and multi_connector_worker_meta.finished_sending
+                ):
+                    expected = (
+                        c.get_finished_count()
+                        or connector_output.expected_finished_count
+                        or self._world_size
+                    )
+                    for req_id, ranks in multi_connector_worker_meta.finished_sending[
+                        i
+                    ].items():
+                        completed = self._completed_async_saves.get(req_id)
+                        owners = self._async_save_owners.get(req_id)
+                        if (
+                            completed is None
+                            or i in completed
+                            or (owners is not None and i not in owners)
+                        ):
+                            continue
+                        workers = self._send_workers[i].setdefault(req_id, set())
+                        workers.update(ranks)
+                        if len(workers) >= expected:
+                            child_sending.add(req_id)
+                else:
+                    child_sending = {
+                        req_id
+                        for req_id in incoming_sending
+                        if i in self._async_save_owners.get(req_id, ())
+                    }
+                connector_output.finished_sending = child_sending or None
                 c.update_connector_output(connector_output)
+                for req_id in connector_output.finished_sending or ():
+                    completed = self._completed_async_saves.get(req_id)
+                    owners = self._async_save_owners.get(req_id)
+                    if completed is None or (owners is not None and i not in owners):
+                        continue
+                    completed.add(i)
+                    self._send_workers[i].pop(req_id, None)
+                    if owners is not None:
+                        owners.discard(i)
+                    if owners is not None and not owners:
+                        finished_sending.add(req_id)
         finally:
             # restore kv_connector_worker_meta
             connector_output.kv_connector_worker_meta = multi_connector_worker_meta
+            connector_output.finished_sending = finished_sending or None
+        aborted_recvs = (
+            set(connector_output.finished_recving or ())
+            & self._async_save_owners.keys()
+        )
+        for req_id in finished_sending | aborted_recvs:
+            self._forget_async_saves(req_id)
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """
@@ -494,12 +554,12 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             [KVConnectorBase_V1], tuple[bool, dict[str, Any] | None]
         ],
     ) -> tuple[bool, dict[str, Any] | None]:
-        async_saves = 0
+        async_save_owners: set[int] = set()
         kv_txfer_params = None
-        for c in self._connectors:
+        for i, c in enumerate(self._connectors):
             async_save, txfer_params = per_connector_fn(c)
             if async_save:
-                async_saves += 1
+                async_save_owners.add(i)
             if txfer_params is not None:
                 if kv_txfer_params is not None:
                     clashes = set(kv_txfer_params) & set(txfer_params)
@@ -511,12 +571,16 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                     kv_txfer_params.update(txfer_params)
                 else:
                     kv_txfer_params = txfer_params
-        if async_saves > 1:
-            self._extra_async_saves[request.request_id] = async_saves - 1
+        completed = self._completed_async_saves.setdefault(request.request_id, set())
+        pending = async_save_owners - completed
+        if pending:
+            self._async_save_owners[request.request_id] = pending
+        else:
+            self._forget_async_saves(request.request_id)
 
         self._requests_to_connector.pop(request.request_id, None)
 
-        return async_saves > 0, kv_txfer_params
+        return bool(pending), kv_txfer_params
 
     def request_finished(
         self,

@@ -31,6 +31,12 @@ class ROCmLatentMoERunner(MoERunner):
     ) -> None:
         super().__init__(*args, **kwargs)
 
+        # Routed experts consume the latent projection, never the shared-expert
+        # input, so the shared MLP can overlap routing and the fused MoE.
+        if self._shared_experts is not None and self.routed_input_transform is not None:
+            self._shared_experts.overlap_on_rocm_tp = True
+            self._shared_experts._is_multistream_safe = lambda: True
+
         transform = self.routed_output_transform
         up_proj = getattr(transform, "up_proj", None)
         tp_size = self.moe_config.tp_size

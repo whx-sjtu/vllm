@@ -6,6 +6,8 @@ from enum import IntEnum
 import torch
 
 import vllm.envs as envs
+from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -61,6 +63,8 @@ class SharedExperts(torch.nn.Module):
         # Might not be safe to run multi-stream mode if routed and shared experts
         # alias the same inputs
         self._is_multistream_safe = is_multistream_safe
+        # Set by runners whose layer benefits from the overlap under ROCm TP.
+        self.overlap_on_rocm_tp = False
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -112,10 +116,19 @@ class SharedExperts(torch.nn.Module):
         if self._mk_can_overlap_shared_experts():
             return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
 
-        # On ROCm, empirically only DP-only deployments benefit from the overlap.
-        overlap_is_beneficial = not current_platform.is_rocm() or (
-            self._moe_config.moe_parallel_config.dp_size > 1
-            and self._moe_config.moe_parallel_config.tp_size == 1
+        # Avoid auxiliary allocations in PIECEWISE graphs. The V2 runner uses
+        # NONE in the forward context while externally capturing FULL graphs.
+        overlap_is_beneficial = (
+            not current_platform.is_rocm()
+            or (
+                self.overlap_on_rocm_tp
+                and get_forward_context().cudagraph_runtime_mode
+                != CUDAGraphMode.PIECEWISE
+            )
+            or (
+                self._moe_config.moe_parallel_config.dp_size > 1
+                and self._moe_config.moe_parallel_config.tp_size == 1
+            )
         )
 
         should_run_shared_in_aux_stream = (

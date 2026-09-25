@@ -641,6 +641,10 @@ class MoRIIOConnectorScheduler:
             # no recurrent-state accounting to do.
             return num_external_tokens, True
 
+        params = request.kv_transfer_params
+        if not params or not params.get("do_remote_prefill"):
+            return 0, False
+
         # READ mode always recomputes the last token locally on the decoder.
         #
         # The second element declares who waits for the KV, not whether it has
@@ -1151,16 +1155,15 @@ class MoRIIOConnectorScheduler:
         and the worker has to guess which slot is live. Mirrors
         ``NixlConnectorScheduler.get_exchange_clipped_blocks``.
         """
+        attn: list[int] = []
         if not self._has_mamba:
             if getattr(self, "kv_cache_config", None) is not None:
-                attn = []
                 for gi, group in enumerate(block_ids):
                     if gi in self._attn_group_ids:
                         attn.extend(group)
                 return attn, []
             first = block_ids[0] if block_ids else []
             return list(first), []
-        attn: list[int] = []
         mamba: list[int] = []
         for gi, group in enumerate(block_ids):
             if gi in self._mamba_group_ids:

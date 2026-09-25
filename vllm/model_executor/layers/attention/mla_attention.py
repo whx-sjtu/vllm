@@ -449,6 +449,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_b_proj = kv_b_proj
         self.dcp_q_replicate = dcp_q_replicate
         self.W_UK_T_dcp_qrep: torch.Tensor | None = None
+        self.W_K_dcp_qrep: torch.Tensor | None = None
+        self.W_K_scale_dcp_qrep: torch.Tensor | None = None
         self.head_size = kv_lora_rank + qk_rope_head_dim
         self.layer_name = prefix
         self.indexer = indexer
@@ -955,12 +957,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_q_pe = mqa_pe_padded
 
             if self.is_aiter_triton_fp4_bmm_enabled:
+                W_K = self.W_K_dcp_qrep if qrep_decode else self.W_K
+                W_K_scale = self.W_K_scale_dcp_qrep if qrep_decode else self.W_K_scale
+                assert W_K is not None and W_K_scale is not None
+
                 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
                 mqa_ql_nope = batched_gemm_a16wfp4(
                     mqa_q_nope,
-                    self.W_K,
-                    self.W_K_scale,
+                    W_K,
+                    W_K_scale,
                     transpose_bm=True,
                     prequant=True,
                     y_scale=self._q_scale if fp8_attention else None,
@@ -1162,12 +1168,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 "backends (q_pad_num_heads)."
             )
             if (
-                self.is_aiter_triton_fp4_bmm_enabled
-                or self.is_aiter_triton_fp8_bmm_enabled
+                self.is_aiter_triton_fp8_bmm_enabled
+                and not self.is_aiter_triton_fp4_bmm_enabled
             ):
                 raise NotImplementedError(
                     "DCP query replication is not implemented for the aiter "
-                    "FP4/FP8 MLA BMM paths."
+                    "FP8 MLA BMM path."
                 )
 
         assert kv_b_proj_weight.shape == (
@@ -1254,6 +1260,19 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
                     self.W_UK_T.contiguous(), dim=0
                 )
+
+        if self.dcp_q_replicate and self.is_aiter_triton_fp4_bmm_enabled:
+            # Gather packed bytes so collectives need no FP4 dtype support.
+            self.W_K_dcp_qrep = (
+                get_dcp_group()
+                .all_gather(self.W_K.contiguous().view(torch.uint8), dim=0)
+                .view(self.W_K.dtype)
+            )
+            self.W_K_scale_dcp_qrep = (
+                get_dcp_group()
+                .all_gather(self.W_K_scale.contiguous().view(torch.uint8), dim=0)
+                .view(self.W_K_scale.dtype)
+            )
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]

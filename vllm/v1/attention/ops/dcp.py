@@ -603,6 +603,11 @@ def _dcp_a2a_pack_send_kernel(
     out_ptr,
     lse_ptr,
     send_ptr,
+    seq_lens_ptr,
+    query_start_loc_ptr,
+    num_seqs,
+    seq_lens_stride,
+    query_start_loc_stride,
     out_stride_B,
     out_stride_H,
     out_stride_D,
@@ -616,10 +621,30 @@ def _dcp_a2a_pack_send_kernel(
     HEAD_DIM: tl.constexpr,
     H_PER_RANK: tl.constexpr,
     LSE_PACK_DIM: tl.constexpr,
+    MASK_EMPTY_ROWS: tl.constexpr,
+    SEQ_BLOCK: tl.constexpr,
 ):
     batch_idx = tl.program_id(0).to(tl.int64)
     local_head_idx = tl.program_id(1).to(tl.int64)
     d_offsets = tl.arange(0, HEAD_DIM)
+
+    # Same rows as mask_dcp_empty_shards_: graph padding past the last query
+    # and requests with no KV on this shard contribute zero weight.
+    row_empty = False
+    if MASK_EMPTY_ROWS:
+        seq_offsets = tl.arange(0, SEQ_BLOCK)
+        query_ends = tl.load(
+            query_start_loc_ptr + (1 + seq_offsets) * query_start_loc_stride,
+            mask=seq_offsets < num_seqs,
+            other=2147483647,
+        )
+        seq_idx = tl.sum((query_ends <= batch_idx).to(tl.int32), axis=0)
+        seq_idx = tl.maximum(tl.minimum(seq_idx, num_seqs - 1), 0)
+        seq_len = tl.load(
+            seq_lens_ptr + seq_idx * seq_lens_stride, mask=num_seqs > 0, other=0
+        )
+        query_end = tl.load(query_start_loc_ptr + num_seqs * query_start_loc_stride)
+        row_empty = (batch_idx >= query_end) | (seq_len == 0)
 
     for rank_idx in tl.static_range(N):
         src_head_idx = rank_idx * H_PER_RANK + local_head_idx
@@ -642,6 +667,8 @@ def _dcp_a2a_pack_send_kernel(
         lse_val = tl.load(
             lse_ptr + batch_idx * lse_stride_B + src_head_idx * lse_stride_H
         ).to(tl.float32)
+        if MASK_EMPTY_ROWS:
+            lse_val = tl.where(row_empty, float("-inf"), lse_val)
         if LSE_PACK_DIM == 1:
             tl.store(
                 send_ptr + send_base + HEAD_DIM * send_stride_D,
@@ -797,12 +824,27 @@ def _dcp_a2a_pack_send(
     seq_lens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
 ) -> None:
-    mask_dcp_empty_shards_(cp_attn_lse, seq_lens, query_start_loc)
+    mask_empty_rows = seq_lens is not None or query_start_loc is not None
+    if mask_empty_rows:
+        if seq_lens is None or query_start_loc is None:
+            raise ValueError("seq_lens and query_start_loc must be provided together")
+        if (
+            seq_lens.ndim != 1
+            or query_start_loc.ndim != 1
+            or query_start_loc.shape[0] != seq_lens.shape[0] + 1
+        ):
+            raise ValueError("query_start_loc must contain one boundary per sequence")
+    num_seqs = seq_lens.shape[0] if seq_lens is not None else 0
     grid = (cp_attn_out.shape[0], h_per_rank, 1)
     _dcp_a2a_pack_send_kernel[grid](
         cp_attn_out,
         cp_attn_lse,
         send_buffer,
+        seq_lens if mask_empty_rows else cp_attn_lse,
+        query_start_loc if mask_empty_rows else cp_attn_lse,
+        num_seqs,
+        seq_lens.stride(0) if seq_lens is not None else 0,
+        query_start_loc.stride(0) if query_start_loc is not None else 0,
         cp_attn_out.stride(0),
         cp_attn_out.stride(1),
         cp_attn_out.stride(2),
@@ -816,6 +858,8 @@ def _dcp_a2a_pack_send(
         HEAD_DIM=head_dim,
         H_PER_RANK=h_per_rank,
         LSE_PACK_DIM=lse_pack_dim,
+        MASK_EMPTY_ROWS=mask_empty_rows,
+        SEQ_BLOCK=triton.next_power_of_2(max(num_seqs, 1)),
     )
 
 
