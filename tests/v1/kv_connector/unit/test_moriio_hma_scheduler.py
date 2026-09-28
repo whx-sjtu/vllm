@@ -592,6 +592,115 @@ def test_update_state_drops_decode_recompute_tail_block():
     ]
 
 
+@pytest.mark.parametrize("import_kv", [False, True])
+def test_read_preserves_local_initialization(import_kv):
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+    pool = BlockPool(num_gpu_blocks=12, enable_caching=True, hash_block_size=2)
+    manager = FullAttentionManager(
+        FullAttentionSpec(
+            block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+        ),
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+        needs_kv_cache_zeroing=True,
+    )
+    manager.allocate_external_computed_blocks("req", 0, 8)
+    manager.allocate_new_blocks("req", 9, 9)
+    manager.allocate_new_blocks("local", 3, 3)
+    attn_blocks = [block.block_id for block in manager.req_to_blocks["req"]]
+    local_block = manager.req_to_blocks["local"][0]
+    new_blocks = manager.take_new_block_ids()
+
+    sched = _make_read_scheduler()
+    sched._reqs_need_save = {}
+    sched._reqs_need_send = {}
+    if import_kv:
+        request = _make_read_request([[10, 11], [90]])
+        request.kv_transfer_params.update(
+            remote_host="127.0.0.1", remote_handshake_port=6001, remote_notify_port=6002
+        )
+        sched.update_state_after_alloc(request, _FakeBlocks((attn_blocks, [200])), 8)
+    output = SimpleNamespace(
+        new_block_ids_to_zero=new_blocks,
+        kv_cache_block_copies=None,
+    )
+
+    meta = sched.build_connector_meta(output)
+
+    if import_kv:
+        assert meta.reqs_to_recv["req"].local_block_ids[0] == attn_blocks[:2]
+        assert output.new_block_ids_to_zero == [attn_blocks[2], local_block.block_id]
+    else:
+        assert output.new_block_ids_to_zero == new_blocks
+
+
+@pytest.mark.parametrize("import_state", [False, True])
+def test_read_preserves_attention_cow_on_state_only_import(import_state):
+    from tests.v1.core.prefix_cache.test_partial_prefix_cache_hits import (
+        make_full_mamba_manager,
+    )
+    from tests.v1.core.test_prefix_caching import make_request
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import init_none_hash
+
+    init_none_hash(sha256)
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        full_block_size=4,
+        mamba_block_size=16,
+        num_speculative_blocks=2,
+    )
+    producer = make_request("cached", list(range(6)), 2, sha256)
+    assert manager.allocate_slots(producer, 6) is not None
+    manager.free(producer)
+    manager.new_step_starts()
+    manager.take_new_block_ids()
+    request = make_request("req", list(range(7)), 2, sha256)
+    hit, computed, _ = manager.get_computed_blocks(request)
+    assert computed == 6
+    # One real prompt-tail token plus four speculative positions.
+    assert manager.allocate_slots(request, 5, computed, hit) is not None
+    blocks = manager.get_blocks("req")
+    copies, retained = manager.take_kv_cache_block_copies()
+    assert len(copies) == 2
+    refs = [block.ref_cnt for block in retained]
+    sched = _make_read_scheduler()
+    sched._ssm_state_slots_are_positional = False
+    sched._num_ssm_scratch_blocks = 2
+    sched._reqs_need_save = {}
+    sched._reqs_need_send = {}
+    if import_state:
+        request.kv_transfer_params = _make_read_request(
+            [[10, 11], [90]]
+        ).kv_transfer_params
+        request.kv_transfer_params.update(
+            remote_host="127.0.0.1",
+            remote_handshake_port=6001,
+            remote_notify_port=6002,
+        )
+        sched.update_state_after_alloc(request, blocks, 0)
+    output = SimpleNamespace(
+        new_block_ids_to_zero=manager.take_new_block_ids(),
+        kv_cache_block_copies=copies,
+        scheduled_new_reqs=[],
+    )
+    meta = sched.build_connector_meta(output)
+    if import_state:
+        assert meta.reqs_to_recv["req"].local_block_ids == [
+            [],
+            [blocks.get_block_ids()[1][0]],
+        ]
+        assert output.kv_cache_block_copies == [copies[0]]
+    else:
+        assert output.kv_cache_block_copies == copies
+    # Cancelling the write does not shorten the retained-endpoint lifetime.
+    assert [block.ref_cnt for block in retained] == refs
+
+
 def test_update_state_pairs_shorter_local_blocks_with_remote_suffix():
     sched = _make_read_scheduler()
     request = _make_read_request([[10, 11, 12], [92]])
@@ -633,6 +742,60 @@ def test_update_state_full_attention_hit_still_carries_mamba_state():
     )
 
     assert sched._reqs_need_recv["req"][1] == [[], [200]]
+
+
+@pytest.mark.parametrize("external_tokens", [0, 16])
+@pytest.mark.parametrize("import_state", [False, True])
+def test_imported_running_slot_reaches_model_state(external_tokens, import_state):
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    sched = _make_read_scheduler()
+    sched._ssm_state_slots_are_positional = False
+    sched._num_ssm_scratch_blocks = 2
+    sched._reqs_need_save = {}
+    sched._reqs_need_send = {}
+    blocks = ([100, 101], [200, 201, 202, 203])
+    new_req = NewRequestData(
+        req_id="req",
+        prompt_token_ids=list(range(17)),
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=blocks,
+        num_computed_tokens=16,
+        lora_request=None,
+    )
+    if import_state:
+        req = _make_read_request([[10, 11], [90]])
+        req.kv_transfer_params.update(
+            remote_host="127.0.0.1",
+            remote_handshake_port=6001,
+            remote_notify_port=6002,
+        )
+        sched.update_state_after_alloc(req, _FakeBlocks(blocks), external_tokens)
+    output = SimpleNamespace(
+        scheduled_new_reqs=[new_req],
+        has_sync_kv_loads=False,
+        new_block_ids_to_zero=None,
+        kv_cache_block_copies=None,
+    )
+    sched.build_connector_meta(output)
+
+    state = object.__new__(MambaHybridModelState)
+    state.rope_state = None
+    state.prompt_embeds_state = None
+    state.cache_config = SimpleNamespace(block_size=16)
+    state._align_mode = True
+    state.num_accepted_tokens_gpu = torch.full((1,), 4, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.full((1,), -1, dtype=torch.int32)
+    state.add_request(0, new_req)
+
+    # At the exact boundary the imported state is in column 1, not the
+    # locally resumed column (num_computed_tokens - 1) // block_size == 0.
+    assert state._mamba_state_idx_gpu.item() == (1 if import_state else 0)
+    assert state.num_accepted_tokens_gpu.item() == 1
+    assert output.has_sync_kv_loads is import_state
 
 
 def test_update_state_preserves_each_mamba_group():

@@ -963,10 +963,8 @@ class MoRIIOConnectorScheduler:
                         adjusted_remote_block_ids = remote_block_ids
                         if num_external_tokens > 0:
                             if self._has_mamba:
-                                # READ is synchronous, so allocate_slots may hash
-                                # destination blocks before this hook runs. Pair
-                                # the attention and recurrent-state suffixes
-                                # independently.
+                                # Pair attention and recurrent-state suffixes
+                                # independently of their cache publication.
                                 remote_attn = list(remote_block_ids[0])
                                 remote_mamba_groups = [
                                     list(group) for group in remote_block_ids[1:]
@@ -1038,7 +1036,7 @@ class MoRIIOConnectorScheduler:
                         else:
                             if self._has_mamba:
                                 # Attention can be a complete local hit, but the
-                                # recurrent state is never prefix-cacheable.
+                                # producer's final recurrent state is still needed.
                                 _, mamba_block_groups = self.split_block_groups(
                                     blocks.get_block_ids()
                                 )
@@ -1190,6 +1188,42 @@ class MoRIIOConnectorScheduler:
     ) -> KVConnectorMetadata:
         meta = MoRIIOConnectorMetadata()
         meta.transfer_id_to_request_id = self.transfer_id_to_request_id
+
+        if self._has_mamba and self.mode == MoRIIOMode.READ and self._reqs_need_recv:
+            if not self._ssm_state_slots_are_positional:
+                for new_req in scheduler_output.scheduled_new_reqs:
+                    recv = self._reqs_need_recv.get(new_req.req_id)
+                    if recv is None:
+                        continue
+                    _, recv_block_groups = recv
+                    _, *recv_mamba_groups = recv_block_groups
+                    block_groups = self.kv_cache_config.select_transfer_block_ids(
+                        new_req.block_ids
+                    )
+                    new_req.mamba_state_idx = block_groups[
+                        self._mamba_group_ids[0]
+                    ].index(recv_mamba_groups[0][0])
+                    # A full attention hit can still import recurrent state.
+                    scheduler_output.has_sync_kv_loads = True
+            # READ replaces these blocks; GPU zeroing or CoW would race the NIC.
+            recv_block_ids = {
+                block_id
+                for _, block_groups in self._reqs_need_recv.values()
+                for group in block_groups
+                for block_id in group
+            }
+            if scheduler_output.new_block_ids_to_zero:
+                scheduler_output.new_block_ids_to_zero = [
+                    block_id
+                    for block_id in scheduler_output.new_block_ids_to_zero
+                    if block_id not in recv_block_ids
+                ] or None
+            if scheduler_output.kv_cache_block_copies:
+                scheduler_output.kv_cache_block_copies = [
+                    copy
+                    for copy in scheduler_output.kv_cache_block_copies
+                    if copy.dst_block_id not in recv_block_ids
+                ] or None
 
         if self.mode == MoRIIOMode.WRITE and get_role() == ROLE.PRODUCER:
             # This is the logic for checking against chunked prefill.
