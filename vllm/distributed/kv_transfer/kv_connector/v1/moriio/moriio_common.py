@@ -307,8 +307,10 @@ class MoRIIOConfig:
         #                     WRITE mode.
         # transfer_timeout -> Timeout for waiting_for_transfer_complete before
         #                     raising TransferError (sec).
-        # defer_timeout    -> Timeout before a deferred send with no finished_sending
-        #                     notification is reaped and its blocks force-freed (sec).
+        # defer_timeout    -> How long to wait for a finished_sending ACK
+        #                     before warning; blocks and transfer-id maps
+        #                     stay held until the ACK (lost ACKs are not
+        #                     force-freed).
         # recv_abort_timeout -> Timeout before an in-flight recv whose RDMA
         #                     completion never arrived is aborted (sec).
 
@@ -417,7 +419,8 @@ class MoRIIOConstants:
     # Overridable via kv_connector_extra_config["transfer_timeout"].
     DEFAULT_TRANSFER_TIMEOUT = 30.0
     # Timeout (seconds) before a deferred send with no finished_sending
-    # notification is reaped and its blocks force-freed.
+    # ACK is logged as stale. Blocks and transfer-id mappings stay
+    # allocated until the ACK; lost ACKs are not force-freed.
     # Overridable via kv_connector_extra_config["defer_timeout"].
     DEFAULT_DEFER_TIMEOUT = 60.0
     # Timeout (seconds) before an in-flight recv whose RDMA completion was lost
