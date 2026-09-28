@@ -3,11 +3,15 @@
 
 import contextlib
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -18,7 +22,82 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+
+def test_full_replay_starts_sync_load_in_full_context(monkeypatch):
+    """The connector must see FULL before replay, where layer hooks do not run."""
+    config = VllmConfig()
+    events = []
+
+    def start_load(context, **kwargs):
+        events.append(("load", context.cudagraph_runtime_mode))
+
+    connector = object.__new__(ActiveKVConnector)
+    connector.vllm_config = config
+    connector.kv_connector = Mock()
+    connector.kv_connector.start_load_kv.side_effect = start_load
+    connector._disabled = False
+    connector._pending_load_kwargs = None
+
+    class ReplayReached(Exception):
+        pass
+
+    def replay(batch_desc):
+        events.append(("replay", batch_desc.cg_mode))
+        raise ReplayReached
+
+    batch = SimpleNamespace(
+        num_tokens=5,
+        num_tokens_after_padding=5,
+        idx_mapping=None,
+        req_ids=["req"],
+        input_ids=None,
+        positions=None,
+    )
+    desc = SimpleNamespace(cg_mode=CUDAGraphMode.FULL, num_tokens=5, num_ubatches=1)
+    runner = Mock()
+    runner.vllm_config = config
+    runner.parallel_config = config.parallel_config
+    runner.dp_size = runner.dcp_size = 1
+    runner.dp_rank = 0
+    runner.decode_query_len = 5
+    runner.pcp_manager = runner.lora_config = runner.ubatch_runner = None
+    runner.aux_output_connector = None
+    runner.is_encoder_decoder = runner.uses_inputs_embeds = False
+    runner.is_first_pp_rank = True
+    runner.observability_config.cudagraph_metrics = False
+    runner.gather_batch_req_state.return_value = (
+        SimpleNamespace(num_tokens=5, has_prefill=False),
+        5,
+    )
+    runner.prepare_inputs.return_value = batch
+    runner.prepare_attn.return_value = ((), object())
+    runner.model_state.prepare_attn.return_value = {}
+    runner.model_state.prepare_inputs.return_value = {}
+    runner.kv_connector = connector
+    runner.cudagraph_manager.run_fullgraph.side_effect = replay
+    monkeypatch.setattr(
+        model_runner_module, "dispatch_cg_and_sync_dp", lambda *a, **kw: (desc, None)
+    )
+    monkeypatch.setattr(
+        model_runner_module, "build_slot_mappings_by_layer", lambda *a: {}
+    )
+    output = SimpleNamespace(
+        total_num_scheduled_tokens=5,
+        num_scheduled_tokens={"req": 5},
+        kv_connector_metadata=object(),
+        has_sync_kv_loads=True,
+    )
+    previous = get_forward_context() if is_forward_context_available() else None
+    with pytest.raises(ReplayReached):
+        GPUModelRunner.execute_model(runner, output)
+
+    assert events == [("load", CUDAGraphMode.FULL), ("replay", CUDAGraphMode.FULL)]
+    assert (
+        get_forward_context() if is_forward_context_available() else None
+    ) is previous
 
 
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
