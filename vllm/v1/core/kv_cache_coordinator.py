@@ -900,16 +900,20 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 # mamba: its finder never drops (draft models have no mamba
                 # layers), so the hit would grow past the candidate.
                 if drop_eagle_block and not isinstance(spec, MambaSpec):
-                    eagle_margin = (
-                        self.hash_block_size
-                        if self.enable_partial_hash_hits
+                    fine_grained_eagle = (
+                        self.enable_partial_hash_hits
                         and manager_cls.supports_fine_grained_hash_lookup
                         and group_block_size > self.hash_block_size
-                        else group_block_size
                     )
-                    _max_length = min(
-                        curr_hit_length + eagle_margin, max_cache_hit_length
+                    eagle_margin = (
+                        self.hash_block_size if fine_grained_eagle else group_block_size
                     )
+                    _max_length = curr_hit_length + eagle_margin
+                    if not fine_grained_eagle:
+                        _max_length = min(_max_length, max_cache_hit_length)
+                    # A partial tail may only have a hash at the prompt end.
+                    # Inspect that proof even when logits require a shorter
+                    # hit; the Eagle drop still bounds the returned length.
                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
                     block_hashes=block_hashes,
                     max_length=_max_length,

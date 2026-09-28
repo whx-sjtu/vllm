@@ -98,7 +98,11 @@ def _prefill(manager, stub, request, *, external=0) -> list[int]:
         if start >= request.num_tokens:
             break
         num_new = Scheduler._mamba_block_aligned_split(
-            stub, request, request.num_tokens - start, new_local, ext
+            stub,
+            request,
+            min(stub.max_num_scheduled_tokens, request.num_tokens - start),
+            new_local,
+            ext,
         )
         if num_new <= 0:
             break
@@ -121,6 +125,68 @@ def _prefill(manager, stub, request, *, external=0) -> list[int]:
         manager.new_step_starts()
         first = False
     return ends
+
+
+@pytest.mark.parametrize("prompt_len", [32767, 32768, 32769])
+@pytest.mark.parametrize("dcp_world_size", [1, 8])
+@pytest.mark.parametrize("shared_prefix_checkpoint", [False, True])
+def test_identical_resend_reuses_hash_aligned_eagle_tail(
+    prompt_len, dcp_world_size, shared_prefix_checkpoint
+):
+    """The logits cap must not hide the hash proving the EAGLE drop.
+
+    With sparse Mamba retention, losing the sole partial-tail checkpoint can
+    force a full prefill. Exercise actual splitting, allocation and lookup,
+    including the TP8/DCP8 geometry where the full-model miss was observed.
+    """
+    block_size, hash_block_size = 1536, 128
+    init_none_hash(sha256)
+    config = _make_hybrid_kv_cache_config(block_size, 1000, ["full", "mamba_align"])
+    full, mamba = config.kv_cache_groups
+    config = replace(
+        config,
+        kv_cache_groups=[
+            replace(full, is_eagle_group=True),
+            replace(
+                mamba,
+                kv_cache_spec=replace(mamba.kv_cache_spec, num_speculative_blocks=3),
+            ),
+        ],
+        prefix_cache_retention_interval=0,
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=1 << 20,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        scheduler_block_size=block_size * dcp_world_size,
+        dcp_world_size=dcp_world_size,
+        use_eagle=True,
+        num_prefill_lookahead=1,
+        enable_mamba_shared_prefix_checkpoint=shared_prefix_checkpoint,
+    )
+    stub = _stub(manager, block_size, hash_block_size)
+    stub.max_num_scheduled_tokens = 16384
+    tokens = list(range(prompt_len))
+    owner = make_request("owner", tokens, hash_block_size, sha256)
+    _prefill(manager, stub, owner)
+    manager.free(owner)
+
+    expected = (prompt_len // hash_block_size - 1) * hash_block_size
+    for name, prompt in [("resend", tokens), ("extension", tokens + [-1])]:
+        request = make_request(name, prompt, hash_block_size, sha256)
+        _, hit, _ = manager.get_computed_blocks(request)
+        assert hit == expected, (name, hit, expected)
+        assert hit < len(prompt)
+
+    # A changed final token cannot supply the proof hash for this checkpoint.
+    divergent = make_request(
+        "divergent",
+        tokens[:expected] + [-2] * hash_block_size,
+        hash_block_size,
+        sha256,
+    )
+    assert manager.get_computed_blocks(divergent)[1] < expected
 
 
 def _orphaned_full_attention_tail(manager, stub, prompt_len):

@@ -390,16 +390,18 @@ class K3DSparkModel(nn.Module):
         self,
         cache_layers: list[MultiHeadLatentAttention],
     ) -> torch.Tensor:
-        # The per-layer KV cache base pointers are stable after allocation, so
-        # build the pointer array once and return it on every call.
-        if not hasattr(self, "_context_cache_ptrs"):
+        # Graph-memory profiling binds temporary KV caches before serving binds
+        # its real allocations. Keep the pointer array stable between rebinds.
+        cache_addresses = tuple(cl.kv_cache.data_ptr() for cl in cache_layers)
+        if cache_addresses != getattr(self, "_context_cache_addresses", None):
             ref_cache = cache_layers[0].kv_cache
             cache_ptrs = torch.tensor(
-                [cl.kv_cache.data_ptr() for cl in cache_layers],
+                cache_addresses,
                 dtype=torch.int64,
                 device=ref_cache.device,
             )
             self._context_cache_ptrs = cache_ptrs
+            self._context_cache_addresses = cache_addresses
         return self._context_cache_ptrs
 
     def forward(

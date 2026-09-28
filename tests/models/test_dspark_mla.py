@@ -16,6 +16,28 @@ from vllm.models.kimi_k3.nvidia import dspark_mla
 from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
 
 
+@pytest.mark.cpu_test
+def test_context_cache_pointers_follow_reallocation_after_profiling():
+    model = K3DSparkModel.__new__(K3DSparkModel)
+    nn.Module.__init__(model)
+    old_caches = [torch.empty(2, 16, 576) for _ in range(5)]
+    layers = [SimpleNamespace(kv_cache=cache) for cache in old_caches]
+    profiling_ptrs = model._get_context_kv_cache_ptrs(layers)
+
+    # The graph-memory probe releases its temporary KV caches and binds new
+    # allocations before the first real draft proposal.
+    new_caches = [torch.empty(4, 16, 576) for _ in layers]
+    for layer, cache in zip(layers, new_caches):
+        layer.kv_cache = cache
+    serving_ptrs = model._get_context_kv_cache_ptrs(layers)
+
+    assert serving_ptrs.tolist() == [cache.data_ptr() for cache in new_caches]
+    assert serving_ptrs is not profiling_ptrs
+    # Keep the metadata allocation stable for graph capture and replay while
+    # the underlying cache bindings are unchanged.
+    assert model._get_context_kv_cache_ptrs(layers) is serving_ptrs
+
+
 def test_dspark_mla_uses_compile_free_model_entrypoint():
     assert ModelRegistry._try_load_model_cls("K3DSparkModel") is K3DSparkForCausalLM
     assert not issubclass(K3DSparkModel, TorchCompileWithNoGuardsWrapper)
