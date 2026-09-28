@@ -219,6 +219,34 @@ def test_async_remote_kv_hit_replays_after_load():
     )
 
 
+@pytest.mark.parametrize("chunk_limit,expected_cached_tokens", [(0, 96), (16, 64)])
+def test_sync_remote_replay_publishes_the_full_adopted_hit(
+    chunk_limit, expected_cached_tokens
+):
+    """Rewinding for SWA replay must not shorten the full-attention publication."""
+    scheduler = _replay_scheduler(
+        long_prefill_token_threshold=chunk_limit,
+        use_kv_connector=MockKVConfig(matched_tokens=64, is_async=False),
+    )
+    request, sibling = create_requests(
+        num_requests=2,
+        num_tokens=NUM_PROMPT_TOKENS,
+        block_size=BLOCK_SIZE,
+    )
+    scheduler.add_request(request)
+    # The chunk cap only applies when another request competes for the budget.
+    scheduler.add_request(sibling)
+    out = scheduler.schedule()
+    assert _new_req_data(out, request).replay_start == 64 - WINDOW
+    assert out.num_scheduled_tokens[request.request_id] == (
+        chunk_limit or NUM_PROMPT_TOKENS - 64 + WINDOW
+    )
+    blocks = scheduler.kv_cache_manager.get_blocks(request.request_id).blocks[FULL]
+    assert sum(b.block_hash is not None for b in blocks) == (
+        expected_cached_tokens // BLOCK_SIZE
+    )
+
+
 def test_remote_kv_hit_is_taken_in_whole_blocks():
     """A hit ending one token short of a block boundary would put the replay
     window's first token in a block the sliding-window group retires, so a

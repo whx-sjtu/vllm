@@ -21,6 +21,9 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
 
 mori_available = importlib.util.find_spec("mori") is not None
 
@@ -44,6 +47,16 @@ MoRIIOMode = moriio_connector.MoRIIOMode
 moriio_common = importlib.import_module(
     "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common"
 )
+get_role = moriio_common.get_role
+set_role = moriio_common.set_role
+
+
+@pytest.fixture
+def restore_moriio_role():
+    """Undo the process-global role a full scheduler construction leaves behind."""
+    role = get_role()
+    yield
+    set_role(role)
 
 
 class _FakeScheduler(moriio_connector.MoRIIOConnectorScheduler):  # type: ignore[name-defined]
@@ -53,6 +66,7 @@ class _FakeScheduler(moriio_connector.MoRIIOConnectorScheduler):  # type: ignore
     def __init__(self, **attrs):
         self._mamba_group_ids: list[int] = []
         self._attn_group_ids: list[int] = [0]
+        self._num_ssm_scratch_blocks = 0
         self._ssm_state_slots_are_positional = False
         self._is_hma_required = False
         self.kv_cache_config = SimpleNamespace(
@@ -110,22 +124,56 @@ def _gdn_split_info(conv_rows=3, key_dim=4, value_dim=8, dtype_size=2):
     )
 
 
-def _mamba_spec(num_states: int = 2):
+def _mamba_spec(num_states: int = 2, *, num_speculative_blocks: int = 0):
     shapes = tuple((1, 1) for _ in range(num_states))
     return moriio_connector.MambaSpec(
         block_size=16,
         shapes=shapes,
         dtypes=(torch.float32,) * num_states,
         mamba_cache_mode="all",
+        num_speculative_blocks=num_speculative_blocks,
     )
 
 
-def _gate_vllm_config(*, read_mode: bool = True, speculative_config=None):
+def _spec_config(method: str):
+    return SimpleNamespace(method=method, use_dspark=lambda: method == "dspark")
+
+
+def _gate_vllm_config(
+    *,
+    read_mode: bool = True,
+    speculative_config=None,
+    block_size: int = 16,
+    num_lookahead_tokens: int = 0,
+    num_speculative_tokens: int = 0,
+    mamba_cache_mode: str = "all",
+    dcp_size: int = 1,
+):
     return SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
-            kv_connector_extra_config={"read_mode": read_mode}
+            kv_connector_extra_config={
+                "read_mode": read_mode,
+                "host_ip": "127.0.0.1",
+                "handshake_port": 6001,
+                "notify_port": 6002,
+            },
+            kv_role="kv_consumer",
         ),
         speculative_config=speculative_config,
+        cache_config=SimpleNamespace(
+            block_size=block_size,
+            mamba_cache_mode=mamba_cache_mode,
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        num_lookahead_tokens=num_lookahead_tokens,
+        num_speculative_tokens=num_speculative_tokens,
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            decode_context_parallel_size=dcp_size,
+            data_parallel_rank=0,
+            data_parallel_size_local=1,
+            data_parallel_size=1,
+        ),
     )
 
 
@@ -196,6 +244,7 @@ def test_exchange_blocks_ignore_transfer_disabled_group():
 
 
 def test_scheduler_rejects_multiple_attention_groups_with_mamba():
+    """A drafter owning its own transfer group is refused, with a hint."""
     config = SimpleNamespace(
         kv_cache_groups=[
             SimpleNamespace(enable_kv_transfer=True, kv_cache_spec=object()),
@@ -205,7 +254,7 @@ def test_scheduler_rejects_multiple_attention_groups_with_mamba():
     )
     config.transfer_groups = tuple(config.kv_cache_groups)
 
-    with pytest.raises(moriio_common.MoRIIOError, match="exactly one transferable"):
+    with pytest.raises(moriio_common.MoRIIOError, match="separate attention group"):
         moriio_connector.MoRIIOConnectorScheduler(_gate_vllm_config(), "engine", config)
 
 
@@ -251,7 +300,7 @@ def test_scheduler_rejects_mamba_group_without_two_states():
         moriio_connector.MoRIIOConnectorScheduler(_gate_vllm_config(), "engine", config)
 
 
-def test_scheduler_rejects_speculative_hybrid_read():
+def test_scheduler_rejects_non_dspark_speculative_hybrid_read():
     config = SimpleNamespace(
         kv_cache_groups=[
             SimpleNamespace(enable_kv_transfer=True, kv_cache_spec=object()),
@@ -262,7 +311,105 @@ def test_scheduler_rejects_speculative_hybrid_read():
 
     with pytest.raises(moriio_common.MoRIIOError, match="speculative decoding"):
         moriio_connector.MoRIIOConnectorScheduler(
-            _gate_vllm_config(speculative_config=object()), "engine", config
+            _gate_vllm_config(speculative_config=_spec_config("ngram")),
+            "engine",
+            config,
+        )
+
+
+def _dspark_wrapped_attention_config(*, dcp_sharded: bool = True):
+    """Mamba first, so a wrapped full-attention group at index 1 has to be found.
+
+    A bare ``isinstance(FullAttentionSpec)`` misses the wrapper and leaves
+    ``_full_attn_group_idx`` at its initial 0, which is the Mamba group.
+    """
+    full = FullAttentionSpec(
+        block_size=4,
+        num_kv_heads=1,
+        head_size=1,
+        dtype=torch.float32,
+        dcp_sharded=dcp_sharded,
+    )
+    config = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(
+                enable_kv_transfer=True,
+                kv_cache_spec=_mamba_spec(num_speculative_blocks=2),
+            ),
+            SimpleNamespace(
+                enable_kv_transfer=True,
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=4, kv_cache_specs={"target": full, "draft": full}
+                ),
+            ),
+        ],
+    )
+    config.transfer_groups = tuple(config.kv_cache_groups)
+    return config
+
+
+@pytest.mark.usefixtures("restore_moriio_role")
+@pytest.mark.parametrize(
+    "dcp_size,dcp_sharded,expected_tail", [(1, True, 4), (4, True, 1), (4, False, 4)]
+)
+def test_scheduler_accepts_dspark_with_wrapped_full_attention(
+    dcp_size, dcp_sharded, expected_tail
+):
+    config = _dspark_wrapped_attention_config(dcp_sharded=dcp_sharded)
+    vllm_config = _gate_vllm_config(
+        speculative_config=_spec_config("dspark"),
+        block_size=4,
+        num_lookahead_tokens=7,
+        num_speculative_tokens=7,
+        mamba_cache_mode="align",
+        dcp_size=dcp_size,
+    )
+    scheduler = moriio_connector.MoRIIOConnectorScheduler(vllm_config, "engine", config)
+
+    assert scheduler._full_attn_group_idx == 1
+    assert scheduler._num_ssm_scratch_blocks == 2
+    assert scheduler._max_decode_tail_blocks == expected_tail
+
+    # A first decode step reserves padded target rows AND drafter lookahead.
+    spec = config.transfer_groups[1].kv_cache_spec
+    manager = FullAttentionManager(
+        spec,
+        block_pool=BlockPool(32, enable_caching=False, hash_block_size=4),
+        enable_caching=False,
+        kv_cache_group_id=1,
+        scheduler_block_size=16,
+        dcp_world_size=dcp_size,
+    )
+    imported_tokens = manager.block_size
+    target_tokens = 1 + vllm_config.num_speculative_tokens
+    manager.allocate_new_blocks(
+        "decode",
+        num_tokens=imported_tokens + target_tokens + vllm_config.num_lookahead_tokens,
+        num_tokens_main_model=imported_tokens + target_tokens,
+    )
+    local = [b.block_id for b in manager.req_to_blocks["decode"]]
+    remote = [100]
+    assert scheduler._align_read_blocks(
+        local, remote, scheduler._max_decode_tail_blocks
+    ) == (local[:1], remote)
+    with pytest.raises(ValueError, match="tail"):
+        scheduler._align_read_blocks(
+            local + [99], remote, scheduler._max_decode_tail_blocks
+        )
+
+
+def test_scheduler_rejects_dspark_with_positional_mamba_cache():
+    """Positional mode counts lookahead in the Mamba allocation, so the
+    one-block recurrent-state tail bound no longer holds."""
+    with pytest.raises(moriio_common.MoRIIOError, match="mamba_cache_mode"):
+        moriio_connector.MoRIIOConnectorScheduler(
+            _gate_vllm_config(
+                speculative_config=_spec_config("dspark"),
+                block_size=4,
+                mamba_cache_mode="all",
+            ),
+            "engine",
+            _dspark_wrapped_attention_config(),
         )
 
 
@@ -314,6 +461,30 @@ def test_split_block_groups_keeps_only_running_state_outside_all_mode():
         _mamba_group_ids=[1],
     )
     assert sched.split_block_groups(([1], [40, 41])) == ([1], [[41]])
+
+
+@pytest.mark.parametrize(
+    "positional,blocks,expected",
+    [
+        # Trailing scratch slots go in either cache mode.
+        (True, [40, 41, 42], [40]),
+        # Outside "all" the running state is picked only after they are gone.
+        (False, [40, 41, 42, 43], [41]),
+        # Never empty: a list shorter than the scratch count keeps one state.
+        (True, [40], [40]),
+        (False, [], []),
+    ],
+)
+def test_split_block_groups_strips_dspark_scratch_slots(positional, blocks, expected):
+    sched = _FakeScheduler(
+        _has_mamba=True,
+        _attn_group_ids=[0],
+        _mamba_group_ids=[1],
+        _num_ssm_scratch_blocks=2,
+        _ssm_state_slots_are_positional=positional,
+    )
+
+    assert sched.split_block_groups(([1], blocks)) == ([1], [expected])
 
 
 # --------------------------------------------------------------------------
@@ -421,6 +592,115 @@ def test_update_state_drops_decode_recompute_tail_block():
     ]
 
 
+@pytest.mark.parametrize("import_kv", [False, True])
+def test_read_preserves_local_initialization(import_kv):
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+    pool = BlockPool(num_gpu_blocks=12, enable_caching=True, hash_block_size=2)
+    manager = FullAttentionManager(
+        FullAttentionSpec(
+            block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+        ),
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=4,
+        needs_kv_cache_zeroing=True,
+    )
+    manager.allocate_external_computed_blocks("req", 0, 8)
+    manager.allocate_new_blocks("req", 9, 9)
+    manager.allocate_new_blocks("local", 3, 3)
+    attn_blocks = [block.block_id for block in manager.req_to_blocks["req"]]
+    local_block = manager.req_to_blocks["local"][0]
+    new_blocks = manager.take_new_block_ids()
+
+    sched = _make_read_scheduler()
+    sched._reqs_need_save = {}
+    sched._reqs_need_send = {}
+    if import_kv:
+        request = _make_read_request([[10, 11], [90]])
+        request.kv_transfer_params.update(
+            remote_host="127.0.0.1", remote_handshake_port=6001, remote_notify_port=6002
+        )
+        sched.update_state_after_alloc(request, _FakeBlocks((attn_blocks, [200])), 8)
+    output = SimpleNamespace(
+        new_block_ids_to_zero=new_blocks,
+        kv_cache_block_copies=None,
+    )
+
+    meta = sched.build_connector_meta(output)
+
+    if import_kv:
+        assert meta.reqs_to_recv["req"].local_block_ids[0] == attn_blocks[:2]
+        assert output.new_block_ids_to_zero == [attn_blocks[2], local_block.block_id]
+    else:
+        assert output.new_block_ids_to_zero == new_blocks
+
+
+@pytest.mark.parametrize("import_state", [False, True])
+def test_read_preserves_attention_cow_on_state_only_import(import_state):
+    from tests.v1.core.prefix_cache.test_partial_prefix_cache_hits import (
+        make_full_mamba_manager,
+    )
+    from tests.v1.core.test_prefix_caching import make_request
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import init_none_hash
+
+    init_none_hash(sha256)
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        full_block_size=4,
+        mamba_block_size=16,
+        num_speculative_blocks=2,
+    )
+    producer = make_request("cached", list(range(6)), 2, sha256)
+    assert manager.allocate_slots(producer, 6) is not None
+    manager.free(producer)
+    manager.new_step_starts()
+    manager.take_new_block_ids()
+    request = make_request("req", list(range(7)), 2, sha256)
+    hit, computed, _ = manager.get_computed_blocks(request)
+    assert computed == 6
+    # One real prompt-tail token plus four speculative positions.
+    assert manager.allocate_slots(request, 5, computed, hit) is not None
+    blocks = manager.get_blocks("req")
+    copies, retained = manager.take_kv_cache_block_copies()
+    assert len(copies) == 2
+    refs = [block.ref_cnt for block in retained]
+    sched = _make_read_scheduler()
+    sched._ssm_state_slots_are_positional = False
+    sched._num_ssm_scratch_blocks = 2
+    sched._reqs_need_save = {}
+    sched._reqs_need_send = {}
+    if import_state:
+        request.kv_transfer_params = _make_read_request(
+            [[10, 11], [90]]
+        ).kv_transfer_params
+        request.kv_transfer_params.update(
+            remote_host="127.0.0.1",
+            remote_handshake_port=6001,
+            remote_notify_port=6002,
+        )
+        sched.update_state_after_alloc(request, blocks, 0)
+    output = SimpleNamespace(
+        new_block_ids_to_zero=manager.take_new_block_ids(),
+        kv_cache_block_copies=copies,
+        scheduled_new_reqs=[],
+    )
+    meta = sched.build_connector_meta(output)
+    if import_state:
+        assert meta.reqs_to_recv["req"].local_block_ids == [
+            [],
+            [blocks.get_block_ids()[1][0]],
+        ]
+        assert output.kv_cache_block_copies == [copies[0]]
+    else:
+        assert output.kv_cache_block_copies == copies
+    # Cancelling the write does not shorten the retained-endpoint lifetime.
+    assert [block.ref_cnt for block in retained] == refs
+
+
 def test_update_state_pairs_shorter_local_blocks_with_remote_suffix():
     sched = _make_read_scheduler()
     request = _make_read_request([[10, 11, 12], [92]])
@@ -434,6 +714,23 @@ def test_update_state_pairs_shorter_local_blocks_with_remote_suffix():
     assert sched._req_kv_params["req"]["remote_block_ids"] == [[12], [92]]
 
 
+def test_update_state_pairs_trimmed_mamba_state_with_remote_state():
+    """The DSpark shape end to end: scratch slots are stripped, the running
+    state is then selected, and the attention list loses its lookahead tail."""
+    sched = _make_read_scheduler()
+    sched._ssm_state_slots_are_positional = False
+    sched._num_ssm_scratch_blocks = 2
+    sched._max_decode_tail_blocks = 2
+    request = _make_read_request([[10, 11], [90]])
+    # Mamba group: [null, running state, scratch, scratch].
+    blocks = _FakeBlocks(all_groups=([100, 101, 102, 103], [200, 201, 202, 203]))
+
+    sched.update_state_after_alloc(request, blocks, num_external_tokens=256)
+
+    assert sched._reqs_need_recv["req"][1] == [[100, 101], [201]]
+    assert sched._req_kv_params["req"]["remote_block_ids"] == [[10, 11], [90]]
+
+
 def test_update_state_full_attention_hit_still_carries_mamba_state():
     sched = _make_read_scheduler()
     request = _make_read_request([[10], [90]])
@@ -445,6 +742,60 @@ def test_update_state_full_attention_hit_still_carries_mamba_state():
     )
 
     assert sched._reqs_need_recv["req"][1] == [[], [200]]
+
+
+@pytest.mark.parametrize("external_tokens", [0, 16])
+@pytest.mark.parametrize("import_state", [False, True])
+def test_imported_running_slot_reaches_model_state(external_tokens, import_state):
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    sched = _make_read_scheduler()
+    sched._ssm_state_slots_are_positional = False
+    sched._num_ssm_scratch_blocks = 2
+    sched._reqs_need_save = {}
+    sched._reqs_need_send = {}
+    blocks = ([100, 101], [200, 201, 202, 203])
+    new_req = NewRequestData(
+        req_id="req",
+        prompt_token_ids=list(range(17)),
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=blocks,
+        num_computed_tokens=16,
+        lora_request=None,
+    )
+    if import_state:
+        req = _make_read_request([[10, 11], [90]])
+        req.kv_transfer_params.update(
+            remote_host="127.0.0.1",
+            remote_handshake_port=6001,
+            remote_notify_port=6002,
+        )
+        sched.update_state_after_alloc(req, _FakeBlocks(blocks), external_tokens)
+    output = SimpleNamespace(
+        scheduled_new_reqs=[new_req],
+        has_sync_kv_loads=False,
+        new_block_ids_to_zero=None,
+        kv_cache_block_copies=None,
+    )
+    sched.build_connector_meta(output)
+
+    state = object.__new__(MambaHybridModelState)
+    state.rope_state = None
+    state.prompt_embeds_state = None
+    state.cache_config = SimpleNamespace(block_size=16)
+    state._align_mode = True
+    state.num_accepted_tokens_gpu = torch.full((1,), 4, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.full((1,), -1, dtype=torch.int32)
+    state.add_request(0, new_req)
+
+    # At the exact boundary the imported state is in column 1, not the
+    # locally resumed column (num_computed_tokens - 1) // block_size == 0.
+    assert state._mamba_state_idx_gpu.item() == (1 if import_state else 0)
+    assert state.num_accepted_tokens_gpu.item() == 1
+    assert output.has_sync_kv_loads is import_state
 
 
 def test_update_state_preserves_each_mamba_group():
@@ -640,7 +991,7 @@ def test_get_num_new_matched_tokens_read_recomputes_last_token():
     req = SimpleNamespace(
         num_prompt_tokens=10,
         prompt_token_ids=list(range(10)),
-        kv_transfer_params=None,
+        kv_transfer_params={"do_remote_prefill": True},
     )
     n, is_async = sched.get_num_new_matched_tokens(req, num_computed_tokens=0)
     # READ always recomputes the final token locally: N-1 - computed.
@@ -677,7 +1028,7 @@ def test_get_num_new_matched_tokens_supports_embeds_only_prompts(
         num_prompt_tokens=10,
         prompt_token_ids=None,
         prompt_embeds=object(),
-        kv_transfer_params=None,
+        kv_transfer_params={"do_remote_prefill": True},
     )
 
     assert sched.get_num_new_matched_tokens(req, num_computed_tokens) == (

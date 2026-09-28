@@ -54,6 +54,8 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    # Running-state column populated by an external Mamba load, if any.
+    mamba_state_idx: int | None = None
 
     @classmethod
     def from_request(

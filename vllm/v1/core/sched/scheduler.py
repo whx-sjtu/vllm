@@ -591,6 +591,7 @@ class Scheduler(SchedulerInterface):
         prefill_scheduled = False
         # Whether any scheduled request has a synchronous connector KV load.
         has_sync_kv_loads = False
+        sync_loads_to_cache: list[tuple[Request, int]] = []
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -1218,7 +1219,9 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    delay_cache_blocks=(
+                        load_kv_async or num_external_computed_tokens > 0
+                    ),
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
@@ -1302,6 +1305,17 @@ class Scheduler(SchedulerInterface):
                         self._skip_zero_block_ids.update(
                             self.connector.get_sync_load_block_ids(request)
                         )
+                    sync_loads_to_cache.append(
+                        (
+                            request,
+                            min(
+                                num_computed_tokens
+                                + num_replay_tokens
+                                + num_tokens_past_hit,
+                                request.num_tokens,
+                            ),
+                        )
+                    )
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -1355,6 +1369,11 @@ class Scheduler(SchedulerInterface):
             # record whether it was capacity-bound.
             if not defer_prefills:
                 self.prefill_capacity_bound = bool(self.waiting)
+
+        # A sync load runs after this step's CoW copies. Do not let another
+        # request use its destination as a CoW source in the same step.
+        for request, num_tokens_to_cache in sync_loads_to_cache:
+            self.kv_cache_manager.cache_blocks(request, num_tokens_to_cache)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
