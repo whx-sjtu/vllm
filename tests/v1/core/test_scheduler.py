@@ -2481,6 +2481,62 @@ def test_has_sync_kv_loads(
     assert output.has_sync_kv_loads is expected_has_sync_loads
 
 
+def test_sync_load_is_published_after_same_step_prefix_lookups():
+    from tests.v1.core.prefix_cache.test_partial_prefix_cache_hits import (
+        make_full_mamba_manager,
+    )
+    from tests.v1.core.test_prefix_caching import make_request
+
+    init_none_hash(sha256)
+    template = create_scheduler(
+        block_size=16,
+        enable_prefix_caching=True,
+        num_blocks=32,
+    )
+    template.cache_config.mamba_cache_mode = "align"
+    config = make_full_mamba_manager(
+        dcp_world_size=1,
+        full_block_size=4,
+        mamba_block_size=16,
+    ).kv_cache_config
+    scheduler = Scheduler(
+        template.vllm_config,
+        config,
+        template.structured_output_manager,
+        block_size=16,
+        hash_block_size=2,
+    )
+    scheduler.connector = Mock()
+    scheduler.connector.supports_divergent_local_hybrid_hits = True
+    scheduler.connector.get_num_new_matched_tokens.side_effect = lambda req, computed: (
+        max(req.num_prompt_tokens - computed - 1, 0),
+        False,
+    )
+    scheduler.connector.build_connector_meta.return_value = None
+    manager = scheduler.kv_cache_manager
+    cached = make_request("cached", [0, 1], 2, sha256)
+    assert manager.allocate_slots(cached, 2) is not None
+    old_attention = manager.get_blocks("cached").blocks[0][0]
+    manager.free(cached)
+    # Attention can be evicted while the Mamba prefix remains cached.
+    manager.block_pool._maybe_evict_cached_block(old_attention)
+    imported = make_request("imported", [0, 1, 8], 2, sha256)
+    sibling = make_request("sibling", [0, 1, 9], 2, sha256)
+    scheduler.add_request(imported)
+    scheduler.add_request(sibling)
+
+    output = scheduler.schedule()
+
+    assert set(output.num_scheduled_tokens) == {"imported", "sibling"}
+    imported_block = manager.get_block_ids("imported")[0][0]
+    assert not any(
+        copy.src_block_id == imported_block
+        for copy in output.kv_cache_block_copies or []
+    )
+    # Deferral lasts through admission, not until another scheduling step.
+    assert manager.block_pool.get_cached_block(imported.block_hashes[0], [0])
+
+
 def test_kv_connector_honors_skip_reading_prefix_cache():
     """A request that must score every prompt row takes no external hit."""
     BLOCK_SIZE = 16
