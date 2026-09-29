@@ -591,6 +591,10 @@ def test_worker_send_metadata_merge_preserves_inputs_and_deduplicates_ranks():
     assert second.finished_sending == ({"r": {0, 1}}, {})
 
 
+def test_multi_connector_mem_pool_context_none(mc: MultiConnector):
+    assert mc.get_mem_pool_context() is None
+
+
 def test_sync_load_zeroing_exclusion_uses_only_selected_connector(mc):
     """An unselected child cannot suppress initialization of fresh pages."""
     request = SimpleNamespace(request_id="r")
@@ -601,10 +605,6 @@ def test_sync_load_zeroing_exclusion_uses_only_selected_connector(mc):
     mc._requests_to_connector["r"] = 1
     assert mc.get_sync_load_block_ids(request) == [3]
     first.get_sync_load_block_ids.assert_not_called()
-
-
-def test_multi_connector_mem_pool_context_none(mc: MultiConnector):
-    assert mc.get_mem_pool_context() is None
 
 
 def test_multi_connector_forwards_mem_pool_context(mc: MultiConnector):
