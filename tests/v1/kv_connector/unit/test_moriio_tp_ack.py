@@ -217,6 +217,7 @@ def test_sync_read_partial_prefix_hit_keeps_local_tail_zeroing(layout):
     read_scheduler._attn_group_ids = [0]
     read_scheduler._mamba_group_ids = [1]
     read_scheduler._ssm_state_slots_are_positional = False
+    read_scheduler._num_ssm_scratch_blocks = 0
     read_scheduler._max_decode_tail_blocks = 1
     read_scheduler.request_id_to_transfer_id = {}
     read_scheduler.transfer_id_to_request_id = {}
