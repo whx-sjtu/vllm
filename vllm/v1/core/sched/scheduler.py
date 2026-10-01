@@ -1300,11 +1300,6 @@ class Scheduler(SchedulerInterface):
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
-                    if self.needs_kv_cache_zeroing:
-                        assert self.connector is not None
-                        self._skip_zero_block_ids.update(
-                            self.connector.get_sync_load_block_ids(request)
-                        )
                     sync_loads_to_cache.append(
                         (
                             request,
