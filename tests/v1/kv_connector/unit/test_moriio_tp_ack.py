@@ -52,6 +52,9 @@ def test_read_matches_only_requests_with_pending_remote_prefill(params, expected
     "mode,consumer,has_mamba,layout,pending,expected",
     [
         (MoRIIOMode.READ, True, True, "LBNHC", [[7, 8], [90]], [7, 8]),
+        (MoRIIOMode.READ, True, True, "LBHNC", [[7, 8], [90]], [7, 8]),
+        (MoRIIOMode.READ, True, True, "LBHNC", [[], [90]], []),
+        (MoRIIOMode.READ, True, True, "LBHNC", None, []),
         (MoRIIOMode.READ, True, True, "LBNHC", [[], [90]], []),
         (MoRIIOMode.READ, True, True, "LBNHC", None, []),
         (MoRIIOMode.READ, False, True, "LBNHC", [[7], [90]], []),

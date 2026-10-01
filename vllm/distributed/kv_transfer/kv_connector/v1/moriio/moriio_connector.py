@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -240,14 +241,14 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
             or scheduler is None
             or not scheduler._has_mamba
             or self._vllm_config.cache_config.get_resolved_kv_cache_layout().name
-            != "LBNHC"
+            not in ("LBHNC", "LBNHC")
         ):
             return []
         pending = scheduler._reqs_need_recv.get(request.request_id)
         if pending is None:
             return []
         # Hybrid READ fills these entire attention pages and aborts on failure.
-        # The destination list already excludes local hits and lookahead blocks.
+        # The scheduler excludes these IDs only from newly allocated page zeroing.
         return pending[1][0]
 
     def __init__(
@@ -2771,6 +2772,16 @@ class MoRIIOConnectorWorker:
                 state = self.moriio_wrapper.poll_transfer_batch(statuses)
                 if statuses and state is TransferBatchState.DONE:
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
+                    if os.environ.get("VLLM_MORIIO_ZEROING_AUDIT") == "1":
+                        logger.info(
+                            "[ZEROING-AUDIT] read_done request=%s transfer=%s "
+                            "rank=%s statuses=%s attention_blocks=%s",
+                            req_id,
+                            xfer_id,
+                            self.tp_rank,
+                            len(statuses),
+                            self._recving_local_blocks.get(req_id),
+                        )
                     done_req_ids.add(xfer_id)
                     self.moriio_wrapper.send_notify(
                         xfer_id,
@@ -3617,6 +3628,14 @@ class MoRIIOConnectorWorker:
                 break
             time.sleep(_backoff)
             _backoff = min(_backoff * 2, _SQ_FULL_BACKOFF_MAX_S)
+        if os.environ.get("VLLM_MORIIO_ZEROING_AUDIT") == "1":
+            logger.info(
+                "[ZEROING-AUDIT] read_post request=%s rank=%s layer=%s bytes=%s",
+                request_id,
+                self.tp_rank,
+                layer_name,
+                sum(sizes),
+            )
         return transfer_status
 
     @staticmethod

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -1544,7 +1545,22 @@ class Scheduler(SchedulerInterface):
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
-        return connector.build_connector_meta(scheduler_output)
+        metadata = connector.build_connector_meta(scheduler_output)
+        if os.environ.get("VLLM_MORIIO_ZEROING_AUDIT") == "1":
+            zero_ids = scheduler_output.new_block_ids_to_zero or []
+            for req_id, request_meta in getattr(metadata, "reqs_to_recv", {}).items():
+                read_ids = request_meta.local_block_ids[0]
+                overlap = set(read_ids).intersection(zero_ids)
+                logger.info(
+                    "[ZEROING-AUDIT] schedule request=%s read_attention=%s "
+                    "zero=%s overlap=%s",
+                    req_id,
+                    read_ids,
+                    zero_ids,
+                    sorted(overlap),
+                )
+                assert not overlap, "RDMA READ destinations scheduled for zeroing"
+        return metadata
 
     def _get_new_block_ids_to_zero(self) -> list[int] | None:
         # Drain new attention block ids every step so the manager-side list
@@ -1555,6 +1571,12 @@ class Scheduler(SchedulerInterface):
 
         if self._skip_zero_block_ids:
             skip = self._skip_zero_block_ids
+            if os.environ.get("VLLM_MORIIO_ZEROING_AUDIT") == "1":
+                logger.info(
+                    "[ZEROING-AUDIT] allocated=%s excluded=%s",
+                    new_block_ids_to_zero,
+                    sorted(skip),
+                )
             new_block_ids_to_zero = [b for b in new_block_ids_to_zero if b not in skip]
             skip.clear()
 

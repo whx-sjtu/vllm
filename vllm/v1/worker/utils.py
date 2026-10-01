@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -230,6 +231,8 @@ class KVBlockZeroer:
         """Zero the KV cache memory for the given block IDs."""
         if not block_ids or self._meta is None:
             return
+        if os.environ.get("VLLM_MORIIO_ZEROING_AUDIT") == "1":
+            logger.info("[ZEROING-AUDIT] zero_kernel blocks=%s", block_ids)
         (
             seg_addrs,
             seg_block_strides,
