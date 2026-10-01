@@ -240,14 +240,14 @@ class MoRIIOConnector(KVConnectorBase_V1, SupportsHMA):
             or scheduler is None
             or not scheduler._has_mamba
             or self._vllm_config.cache_config.get_resolved_kv_cache_layout().name
-            != "LBNHC"
+            not in ("LBHNC", "LBNHC")
         ):
             return []
         pending = scheduler._reqs_need_recv.get(request.request_id)
         if pending is None:
             return []
         # Hybrid READ fills these entire attention pages and aborts on failure.
-        # The destination list already excludes local hits and lookahead blocks.
+        # The scheduler excludes these IDs only from newly allocated page zeroing.
         return pending[1][0]
 
     def __init__(
