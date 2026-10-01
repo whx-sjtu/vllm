@@ -14,6 +14,38 @@ from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.deepseek_v4.nvidia import dspark as dsv4_dspark
 from vllm.models.kimi_k3.nvidia import dspark_mla
 from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
+from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+
+def test_k3_dspark_kv_spec_merges_with_replicated_target_mla():
+    """Replicated latent KV must not split the draft from the target KV group."""
+    draft = SimpleNamespace(
+        kv_cache_dtype="fp8",
+        head_size=576,
+        non_causal_multi_token_decode=True,
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=1536),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    draft_spec = MultiHeadLatentAttention.get_kv_cache_spec(draft, config)
+    target_spec = MLAAttentionSpec(
+        block_size=1536,
+        num_kv_heads=1,
+        max_tp_shards=1,
+        head_size=576,
+        dtype=draft_spec.dtype,
+        cache_dtype_str="fp8",
+        kv_quant_mode=draft_spec.kv_quant_mode,
+    )
+
+    merged = MLAAttentionSpec.merge([target_spec, draft_spec])
+
+    assert merged.max_tp_shards == 1
+    assert merged.dcp_sharded
+    assert merged.non_causal_multi_token_decode
+    assert merged.page_size_bytes == target_spec.page_size_bytes
 
 
 def test_dspark_mla_uses_compile_free_model_entrypoint():
