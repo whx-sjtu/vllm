@@ -6,13 +6,12 @@ import threading
 import time
 from types import MethodType, SimpleNamespace
 
-from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_wrapper import (
-    MoRIIOWrapper,
-)
-
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
     MoRIIOConnectorScheduler,
     MoRIIOConnectorWorker,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
+    MoRIIOWrapper,
 )
 from vllm.v1.outputs import KVConnectorOutput
 

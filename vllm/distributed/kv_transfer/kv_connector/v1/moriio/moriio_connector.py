@@ -1514,7 +1514,7 @@ class MoRIIOConnectorScheduler:
           while a consumer READ may still reference them, and dropping
           the mapping would make a late ACK unable to free. KV-cache
           pressure from held blocks is the backpressure if the ACK path
-          is lost; a consumer transfer timeout still sends ``release``.
+          is lost; a consumer timeout does not release in-flight READs.
         * A parked ACK that never matches a deferral before its own
           deadline is a stale duplicate and is dropped.
 
