@@ -1545,13 +1545,16 @@ def _make_fake_kv_cache_manager():
 
 
 @pytest.mark.cpu_test
-def test_zeroing_block_ids_cover_only_loaded_attention_blocks():
+@pytest.mark.parametrize("enable_kv_transfer", [False, True])
+def test_zeroing_block_ids_cover_only_loaded_attention_blocks(enable_kv_transfer):
     """Only zero-recorded (attention) groups contribute, sliced to the
     externally-loaded token range; Mamba state blocks are never zeroed."""
     manager = _make_fake_kv_cache_manager()
+    manager.kv_cache_config.kv_cache_groups[0].enable_kv_transfer = enable_kv_transfer
 
     # Tokens [0, 16) are locally cached; the load covers tokens [16, 56).
-    assert manager.get_zeroing_block_ids_in_range("req-1", 16, 56) == [11, 12, 13]
+    expected = [11, 12, 13] if enable_kv_transfer else []
+    assert manager.get_zeroing_block_ids_in_range("req-1", 16, 56) == expected
 
 
 @pytest.mark.cpu_test

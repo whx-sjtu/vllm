@@ -26,41 +26,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
 )
 
 
-@pytest.mark.parametrize(
-    "mode,consumer,has_mamba,layout,pending,expected",
-    [
-        (MoRIIOMode.READ, True, True, "LBNHC", [[7, 8], [90]], [7, 8]),
-        (MoRIIOMode.READ, True, True, "LBHNC", [[7, 8], [90]], [7, 8]),
-        (MoRIIOMode.READ, True, True, "LBHNC", [[], [90]], []),
-        (MoRIIOMode.READ, True, True, "LBHNC", None, []),
-        (MoRIIOMode.READ, True, True, "LBNHC", [[], [90]], []),
-        (MoRIIOMode.READ, True, True, "LBNHC", None, []),
-        (MoRIIOMode.READ, False, True, "LBNHC", [[7], [90]], []),
-        (MoRIIOMode.READ, True, False, "LBNHC", [[7]], []),
-        (MoRIIOMode.READ, True, True, "NBLHC", [[7], [90]], []),
-        (MoRIIOMode.WRITE, True, True, "LBNHC", [[7], [90]], []),
-    ],
-)
-def test_sync_read_initializes_only_supported_attention_destinations(
-    mode, consumer, has_mamba, layout, pending, expected
-):
-    connector = MoRIIOConnector.__new__(MoRIIOConnector)
-    connector.mode = mode
-    connector.kv_transfer_config = SimpleNamespace(is_kv_consumer=consumer)
-    connector._vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(
-            get_resolved_kv_cache_layout=lambda: SimpleNamespace(name=layout)
-        )
-    )
-    request = SimpleNamespace(request_id="req")
-    connector.connector_scheduler = SimpleNamespace(
-        _has_mamba=has_mamba,
-        _reqs_need_recv={} if pending is None else {"req": (request, pending)},
-    )
-
-    assert connector.get_sync_load_block_ids(request) == expected
-
-
 def test_remote_tp_rank_same_tp_maps_to_self():
     assert [get_moriio_remote_tp_rank(rank, 4, 4) for rank in range(4)] == [
         0,
@@ -70,9 +35,9 @@ def test_remote_tp_rank_same_tp_maps_to_self():
     ]
 
 
-@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC"])
-def test_sync_read_partial_prefix_hit_keeps_local_tail_zeroing(layout):
+def test_sync_read_partial_prefix_hit_keeps_local_tail_zeroing():
     """Pending READs may include a hit; the local tail must still be zeroed."""
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.scheduler import Scheduler
 
     read_scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
@@ -80,8 +45,8 @@ def test_sync_read_partial_prefix_hit_keeps_local_tail_zeroing(layout):
     read_scheduler._has_mamba = True
     read_scheduler._attn_group_ids = [0]
     read_scheduler._mamba_group_ids = [1]
-    read_scheduler._ssm_state_slots_are_positional = False
     read_scheduler._num_ssm_scratch_blocks = 0
+    read_scheduler._ssm_state_slots_are_positional = False
     read_scheduler._max_decode_tail_blocks = 1
     read_scheduler.request_id_to_transfer_id = {}
     read_scheduler.transfer_id_to_request_id = {}
@@ -103,26 +68,35 @@ def test_sync_read_partial_prefix_hit_keeps_local_tail_zeroing(layout):
     connector = MoRIIOConnector.__new__(MoRIIOConnector)
     connector.mode = MoRIIOMode.READ
     connector.kv_transfer_config = SimpleNamespace(is_kv_consumer=True)
-    connector._vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(
-            get_resolved_kv_cache_layout=lambda: SimpleNamespace(name=layout)
-        )
-    )
     connector.connector_scheduler = read_scheduler
     connector.connector_worker = None
     # With 16-token blocks, page 7 is a local hit, 8 is a new READ
     # destination, and 9 holds the locally recomputed final token.
     blocks = SimpleNamespace(get_block_ids=lambda: ([7, 8, 9], [90]))
     connector.update_state_after_alloc(request, blocks, num_external_tokens=16)
-    pending = connector.get_sync_load_block_ids(request)
+    pending = read_scheduler._reqs_need_recv[request.request_id][1][0]
     assert pending == [7, 8]
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.needs_kv_cache_zeroing = True
-    scheduler._skip_zero_block_ids = set(pending)
-    scheduler.kv_cache_manager = SimpleNamespace(
-        take_new_block_ids=Mock(side_effect=[[8, 9, 90], [7]]),
+    cache = KVCacheManager.__new__(KVCacheManager)
+    cache.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(enable_kv_transfer=True)],
     )
+    cache.coordinator = SimpleNamespace(
+        single_type_managers=[
+            SimpleNamespace(
+                records_new_block_ids=True,
+                block_size=16,
+                req_to_blocks={"req": [SimpleNamespace(block_id=b) for b in [7, 8, 9]]},
+                take_new_block_ids=Mock(side_effect=[[8, 9, 90], [7]]),
+            )
+        ]
+    )
+    scheduler.kv_cache_manager = cache
+    loaded = cache.get_zeroing_block_ids_in_range("req", 16, 32)
+    assert loaded == [8] and set(loaded) <= set(pending)
+    scheduler._skip_zero_block_ids = set(loaded)
     assert scheduler._get_new_block_ids_to_zero() == [9, 90]
     # Exclusions are scoped to this step, including any non-new hit IDs.
     assert scheduler._get_new_block_ids_to_zero() == [7]
