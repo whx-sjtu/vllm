@@ -1295,10 +1295,18 @@ class Scheduler(SchedulerInterface):
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
-                    if self.needs_kv_cache_zeroing:
-                        assert self.connector is not None
+                    if self.has_mamba_layers:
+                        # Hybrid sync loads fill whole attention pages. Other
+                        # sync loaders may only initialize the matched tokens.
                         self._skip_zero_block_ids.update(
-                            self.connector.get_sync_load_block_ids(request)
+                            self.kv_cache_manager.get_zeroing_block_ids_in_range(
+                                request_id,
+                                num_new_local_computed_tokens,
+                                # Prefix replay rewinds num_computed_tokens,
+                                # but the load still writes the entire hit.
+                                num_new_local_computed_tokens
+                                + num_external_computed_tokens,
+                            )
                         )
                 if self.log_stats:
                     request.record_event(
