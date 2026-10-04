@@ -4565,6 +4565,52 @@ def test_draft_group_annotated_on_hybrid_general_path():
     assert "draft.attn.0" in flagged[0].layer_names
 
 
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8"])
+def test_k3_dspark_model_specs_share_one_transferable_attention_group(cache_dtype):
+    """Actual target/draft specs must merge for MoRIIO hybrid READ admission."""
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.models.kimi_k3.nvidia.mla import MultiHeadLatentAttention
+
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=1536),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+    )
+    target = MLAAttention.__new__(MLAAttention)
+    draft = MultiHeadLatentAttention.__new__(MultiHeadLatentAttention)
+    for layer in (target, draft):
+        torch.nn.Module.__init__(layer)
+        layer.kv_cache_dtype = cache_dtype
+        layer.head_size = 576
+    target.non_causal_multi_token_decode = False
+    target.sliding_window = None
+    target.indexer = None
+    target.attn_backend = SimpleNamespace(get_name=lambda: "ROCM_AITER_MLA")
+    target._uses_flat_kv_cache = lambda: False
+    draft.non_causal_multi_token_decode = True
+    target_spec = target.get_kv_cache_spec(config)
+    draft_spec = draft.get_kv_cache_spec(config)
+    mamba_spec = replace(
+        new_mamba_spec(block_size=1536, mamba_cache_mode="align"),
+        page_size_padded=target_spec.page_size_bytes,
+    )
+    specs = {f"target.mamba.{i}": mamba_spec for i in range(69)}
+    specs.update({f"target.attn.{i}": target_spec for i in range(24)})
+    specs.update({f"draft.attn.{i}": draft_spec for i in range(5)})
+
+    grouping_config = _spec_decode_grouping_config()
+    grouping_config.cache_config.get_resolved_kv_cache_layout = lambda: (
+        KVCacheLayout.LBNHC
+    )
+    groups = get_kv_cache_groups(grouping_config, specs)
+
+    attention_groups = [g for g in groups if is_full_attention_spec(g.kv_cache_spec)]
+    assert len(attention_groups) == 1
+    assert set(attention_groups[0].layer_names) == {
+        name for name in specs if ".attn." in name
+    }
+    assert attention_groups[0].enable_kv_transfer
+
+
 def test_mamba_groups_never_flagged_even_when_draft_shares_a_group():
     # Packed uniform-type groups can contain distinct target and draft layer
     # specs; the combined group still holds volatile draft KV and must be
