@@ -8,30 +8,17 @@ GPU or the ``mori`` runtime: per-group block-id splitting, the READ/WRITE
 ``N-1`` token accounting, P-side prompt truncation, and offset-template cache
 wiring.
 
-Like ``test_moriio_kv_layout.py`` the whole module is skipped unless it is
-running on ROCm with ``mori`` installed (importing the connector pulls in
-``mori``). The authoritative run happens on the MIA recipe image.
 """
 
 import importlib
-import importlib.util
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm.platforms import current_platform
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec, UniformTypeKVCacheSpecs
-
-mori_available = importlib.util.find_spec("mori") is not None
-
-if not (current_platform.is_rocm() and mori_available):
-    pytest.skip(
-        "MoRIIOs are only available on ROCm with mori package installed",
-        allow_module_level=True,
-    )
 
 moriio_connector = importlib.import_module(
     "vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector"
@@ -386,6 +373,13 @@ def test_scheduler_accepts_dspark_with_wrapped_full_attention(
         num_tokens_main_model=imported_tokens + target_tokens,
     )
     local = [b.block_id for b in manager.req_to_blocks["decode"]]
+    assert scheduler._attn_block_size == manager.block_size
+    request = _make_read_request(
+        [list(range(10, 18)), [90]], 8 * manager.block_size + 1
+    )
+    assert scheduler._select_read_attention(
+        request, 2 * manager.block_size, list(range(100, 109)), list(range(10, 18))
+    ) == ([106, 107], [16, 17])
     remote = [100]
     assert scheduler._align_read_blocks(
         local, remote, scheduler._max_decode_tail_blocks
@@ -527,16 +521,25 @@ def _make_read_scheduler():
         _reqs_need_recv={},
         _req_kv_params={},
         _max_decode_tail_blocks=1,
+        _attn_block_size=128,
     )
 
 
-def _make_read_request(remote_block_ids):
+def _make_read_request(remote_block_ids, num_prompt_tokens=None):
     return SimpleNamespace(
         request_id="req",
+        num_prompt_tokens=(
+            len(remote_block_ids[0]) * 128 + 1
+            if num_prompt_tokens is None
+            else num_prompt_tokens
+        ),
         kv_transfer_params={
             "do_remote_prefill": True,
             "transfer_id": "tx",
             "remote_engine_id": "prefill",
+            "remote_host": "127.0.0.1",
+            "remote_handshake_port": 6001,
+            "remote_notify_port": 6002,
             "remote_block_ids": remote_block_ids,
         },
     )
@@ -558,17 +561,184 @@ def test_update_state_drops_decode_recompute_tail_block():
     ]
 
 
-def test_update_state_pairs_shorter_local_blocks_with_remote_suffix():
+def test_update_state_excludes_cached_prefix_from_complete_block_table():
     sched = _make_read_scheduler()
-    request = _make_read_request([[10, 11, 12], [92]])
+    request = _make_read_request([list(range(10, 18)), [92]])
     blocks = _FakeBlocks(
-        all_groups=([102], [202]),
+        all_groups=(list(range(100, 109)), [202]),
     )
 
-    sched.update_state_after_alloc(request, blocks, num_external_tokens=64)
+    sched.update_state_after_alloc(request, blocks, num_external_tokens=2 * 128)
 
-    assert sched._reqs_need_recv["req"][1] == [[102], [202]]
-    assert sched._req_kv_params["req"]["remote_block_ids"] == [[12], [92]]
+    assert sched._reqs_need_recv["req"][1] == [[106, 107], [202]]
+    assert sched._req_kv_params["req"]["remote_block_ids"] == [[16, 17], [92]]
+
+
+@pytest.mark.parametrize("local_tokens", [0, 128, 256])
+@pytest.mark.parametrize("remote_tokens", [383, 384, 385])
+def test_update_state_read_token_boundaries(local_tokens, remote_tokens):
+    """Transfer partial remote pages, but never the decode-only tail page."""
+    sched = _make_read_scheduler()
+    request = _make_read_request(
+        [[10, 11, 12, 13], [90]], num_prompt_tokens=remote_tokens + 1
+    )
+    blocks = _FakeBlocks(all_groups=([100, 101, 102, 103], [200]))
+
+    sched.update_state_after_alloc(
+        request, blocks, num_external_tokens=remote_tokens - local_tokens
+    )
+
+    first = local_tokens // 128
+    last = (remote_tokens + 127) // 128
+    assert sched._reqs_need_recv["req"][1] == [
+        list(range(100 + first, 100 + last)),
+        [200],
+    ]
+    assert sched._req_kv_params["req"]["remote_block_ids"] == [
+        list(range(10 + first, 10 + last)),
+        [90],
+    ]
+
+
+def test_update_state_uses_current_external_tokens_after_rescheduling():
+    sched = _make_read_scheduler()
+    request = _make_read_request([[10, 11, 12], [90]])
+    blocks = _FakeBlocks(all_groups=([100, 101, 102, 103], [200]))
+    # A lookup can be abandoned or superseded after allocation/preemption.
+    assert sched.get_num_new_matched_tokens(request, 256) == (128, False)
+    sched.update_state_after_alloc(request, blocks, num_external_tokens=384)
+    assert sched._reqs_need_recv["req"][1] == [[100, 101, 102], [200]]
+
+
+@pytest.mark.parametrize("evict_attention_tail", [False, True])
+def test_scheduler_allocated_hashed_pages_and_shared_prefix(
+    evict_attention_tail, monkeypatch
+):
+    """Real admission passes cached AND newly hashed receive pages to MoRI."""
+    from tests.v1.core.test_scheduler import (
+        _create_hybrid_mamba_connector_scheduler,
+        _seed_hybrid_prefix,
+    )
+    from tests.v1.core.utils import create_requests
+
+    scheduler = _create_hybrid_mamba_connector_scheduler(0)
+    manager = scheduler.kv_cache_manager
+    fa_ids, mamba_ids = _seed_hybrid_prefix(manager, 6, 16)
+    if evict_attention_tail:
+        # FA reaches 3 pages, Mamba reaches 6, but only the first checkpoint
+        # agrees with the remaining FA prefix. READ must use that final hit.
+        manager.block_pool.evict_blocks(set(fa_ids[3:] + mamba_ids[1:5]))
+    hit_pages = 1 if evict_attention_tail else 6
+    mori = _make_read_scheduler()
+    mori._attn_block_size = 16
+    mori._reqs_need_save = {}
+    mori._reqs_need_send = {}
+    mori._reqs_need_pending_save = {}
+    monkeypatch.setattr(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        mori.get_num_new_matched_tokens,
+    )
+    captured = []
+
+    def after_alloc(request, blocks, external_tokens):
+        attention = blocks.blocks[0]
+        assert len(attention) == 9
+        assert all(b.block_hash is not None for b in attention[:8])
+        assert external_tokens == (8 - hit_pages) * 16
+        mori.update_state_after_alloc(request, blocks, external_tokens)
+        selected = mori._reqs_need_recv[request.request_id][1]
+        assert selected[0] == [b.block_id for b in attention[hit_pages:8]]
+        assert not set(fa_ids[:hit_pages]).intersection(selected[0])
+        assert mori._req_kv_params[request.request_id]["remote_block_ids"][0] == list(
+            range(10 + hit_pages, 18)
+        )
+        captured.append((blocks.get_block_ids(), selected))
+
+    monkeypatch.setattr(scheduler.connector, "update_state_after_alloc", after_alloc)
+    # Keep both requests active so their prefix pages are actually shared.
+    for index in range(2):
+        request = create_requests(
+            num_requests=1,
+            num_tokens=129,
+            same_prompt=True,
+            block_size=16,
+            req_ids=[f"read-{index}"],
+        )[0]
+        request.kv_transfer_params = _make_read_request(
+            [list(range(10, 18)), [90]], 129
+        ).kv_transfer_params
+        scheduler.add_request(request)
+        output = scheduler.schedule()
+        full, selected = captured[-1]
+        output.new_block_ids_to_zero = list(full[0]) + [999]
+        metadata = mori.build_connector_meta(output)
+        assert metadata.reqs_to_recv[request.request_id].local_block_ids == selected
+        assert output.new_block_ids_to_zero == full[0][:hit_pages] + [full[0][8], 999]
+        if index == 0:
+            # Prevent this admitted-but-unexecuted request from adopting the
+            # target suffix as a cache hit for the second request.
+            manager.block_pool.evict_blocks(set(full[0][hit_pages:8]))
+    assert captured[0][0][0][:hit_pages] == captured[1][0][0][:hit_pages]
+
+
+@pytest.mark.parametrize("local,remote", [([100], [10, 11]), ([100, 101], [10])])
+def test_update_state_rejects_incomplete_attention_table(local, remote):
+    sched = _make_read_scheduler()
+    request = _make_read_request([remote, [90]], 257)
+    with pytest.raises(moriio_common.MoRIIOError, match="do not cover"):
+        sched.update_state_after_alloc(
+            request, _FakeBlocks((local, [200])), num_external_tokens=128
+        )
+
+
+def test_scheduler_remote_hit_replaces_shared_partial_page(monkeypatch):
+    """A longer remote hit must use a fresh page, with no racing partial CoW."""
+    from tests.v1.core.prefix_cache.test_partial_prefix_cache_hits import (
+        make_full_mamba_manager,
+    )
+    from tests.v1.core.test_prefix_caching import make_request
+    from tests.v1.core.test_scheduler import _create_hybrid_mamba_connector_scheduler
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import init_none_hash
+
+    init_none_hash(sha256)
+    scheduler = _create_hybrid_mamba_connector_scheduler(0)
+    manager = make_full_mamba_manager(
+        dcp_world_size=4,
+        full_block_size=4,
+        mamba_block_size=4,
+    )
+    scheduler.kv_cache_manager = manager
+    source = make_request("source", list(range(23)), 2, sha256)
+    computed, count, _ = manager.get_computed_blocks(source)
+    assert manager.allocate_slots(source, 22, count, computed) is not None
+    source.num_computed_tokens = 22
+    manager.new_step_starts()
+    source_pages = manager.get_block_ids(source.request_id)[0]
+    request = make_request("target", list(range(33)), 2, sha256)
+    assert manager.get_computed_blocks(request)[1] == 22
+    mori = _make_read_scheduler()
+    mori._attn_block_size = 16
+    request.kv_transfer_params = _make_read_request(
+        [[10, 11], [90]], 33
+    ).kv_transfer_params
+    monkeypatch.setattr(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        mori.get_num_new_matched_tokens,
+    )
+    monkeypatch.setattr(
+        scheduler.connector, "update_state_after_alloc", mori.update_state_after_alloc
+    )
+    scheduler.add_request(request)
+    scheduler.schedule()
+    target_pages = manager.get_block_ids(request.request_id)[0]
+    assert target_pages[0] == source_pages[0]
+    assert target_pages[1] != source_pages[1]
+    assert mori._reqs_need_recv[request.request_id][1][0] == [target_pages[1]]
+    assert manager.get_block_ids(source.request_id)[0] == source_pages
+    assert manager.take_kv_cache_block_copies() == ([], [])
 
 
 def test_update_state_pairs_trimmed_mamba_state_with_remote_state():
