@@ -2421,6 +2421,91 @@ def _make_hybrid_attention_mamba_scheduler(
     )
 
 
+def test_gpu_hit_preserves_older_cpu_state_for_a_later_branch() -> None:
+    """A longer GPU hit must refresh an older, still compatible CPU state."""
+    fix = _make_hybrid_attention_mamba_scheduler(
+        num_cpu_blocks=12,
+        hash_block_size=BLOCK_SIZE,
+        dcp_world_size=1,
+    )
+    sched = fix.scheduler
+    pool = sched.cpu_block_pool
+    request = _make_cp_request(num_blocks=4, virtual_block_size=BLOCK_SIZE)
+
+    def publish(key, group):
+        (block,) = pool.get_new_blocks(1)
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(key, group), block, BLOCK_SIZE
+        )
+        pool.free_blocks([block])
+        return block
+
+    # The older state is at a hash boundary inside its physical Mamba block.
+    older = publish(request.block_hashes[1], 1)
+    attention = [publish(key, 0) for key in request.block_hashes]
+    publish(request.block_hashes[3], 1)
+    publish(b"x" * 32, 0)
+    assert request.prompt_token_ids is not None
+    branch = Request(
+        request_id="later-branch",
+        prompt_token_ids=request.prompt_token_ids[: 3 * BLOCK_SIZE]
+        + [123456] * (BLOCK_SIZE + 1),
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=request._block_hasher,
+    )
+    assert branch.block_hashes[:3] == request.block_hashes[:3]
+    assert branch.block_hashes[3] != request.block_hashes[3]
+    before = sched.cpu_coordinator.find_longest_cache_hit(
+        branch.block_hashes, branch.num_tokens - 1
+    )[1]
+    assert before == 2 * BLOCK_SIZE
+
+    free_before = pool.get_num_free_blocks()
+    assert sched.get_num_new_matched_tokens(request, 4 * BLOCK_SIZE) == (0, False)
+    assert pool.get_num_free_blocks() == free_before
+    assert older.ref_cnt == 0
+    never_used = sum(
+        b.block_hash is None for b in pool.free_block_queue.get_all_free_blocks()
+    )
+    pool.get_new_blocks(never_used + 1)
+    assert all(pool.get_cached_block(key, [0]) for key in request.block_hashes)
+    assert all(block.ref_cnt == 0 for block in attention)
+    assert sched.get_num_new_matched_tokens(branch, 0) == (2 * BLOCK_SIZE, True)
+
+
+def test_cpu_state_refresh_respects_local_prefix_and_existing_pin() -> None:
+    """Aliases preserve a concurrent pin; states beyond the GPU hit stay old."""
+    fix = _make_hybrid_attention_mamba_scheduler(
+        num_cpu_blocks=12,
+        hash_block_size=BLOCK_SIZE,
+        dcp_world_size=1,
+    )
+    sched = fix.scheduler
+    pool = sched.cpu_block_pool
+    request = _make_cp_request(num_blocks=4, virtual_block_size=BLOCK_SIZE)
+    pinned, outside, other = pool.get_new_blocks(3)
+    for key in request.block_hashes[:2]:
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(key, 1), pinned, BLOCK_SIZE
+        )
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(request.block_hashes[3], 1),
+        outside,
+        BLOCK_SIZE,
+    )
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(b"x" * 32, 1), other, BLOCK_SIZE
+    )
+    pool.free_blocks([outside, other])
+    before = pool.free_block_queue.get_all_free_blocks()
+    # This fine-grained GPU hit cannot start a whole-block CPU transfer.
+    assert sched.get_num_new_matched_tokens(request, 2 * BLOCK_SIZE) == (0, False)
+    assert pinned.ref_cnt == 1
+    assert pool.free_block_queue.get_all_free_blocks() == before
+
+
 def test_hybrid_store_uses_resolved_group_block_sizes() -> None:
     """Replicated groups must not be scaled by the DCP world size.
 
