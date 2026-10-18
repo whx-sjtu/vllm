@@ -2475,10 +2475,62 @@ def test_gpu_hit_preserves_older_cpu_state_for_a_later_branch() -> None:
     assert sched.get_num_new_matched_tokens(branch, 0) == (2 * BLOCK_SIZE, True)
 
 
-def test_cpu_state_refresh_respects_local_prefix_and_existing_pin() -> None:
+def test_gpu_hit_preserves_partial_cpu_attention_for_a_later_branch() -> None:
+    """A branch needs the older FA tail even when longer requests hit on GPU."""
+    fix = _make_hybrid_attention_mamba_scheduler(
+        num_cpu_blocks=12,
+        hash_block_size=BLOCK_SIZE,
+    )
+    sched = fix.scheduler
+    pool = sched.cpu_block_pool
+    request = _make_cp_request(num_blocks=4, virtual_block_size=BLOCK_SIZE)
+    assert sched.group_block_sizes == (4 * BLOCK_SIZE, 4 * BLOCK_SIZE)
+
+    def publish(key, group):
+        (block,) = pool.get_new_blocks(1)
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(key, group), block, BLOCK_SIZE
+        )
+        pool.free_blocks([block])
+
+    publish(request.block_hashes[1], 0)
+    publish(request.block_hashes[1], 1)
+    publish(request.block_hashes[3], 0)
+    publish(request.block_hashes[3], 1)
+    publish(b"x" * 32, 0)
+    assert request.prompt_token_ids is not None
+    branch = Request(
+        request_id="later-fa-branch",
+        prompt_token_ids=request.prompt_token_ids[: 3 * BLOCK_SIZE]
+        + [123456] * (BLOCK_SIZE + 1),
+        sampling_params=request.sampling_params,
+        pooling_params=None,
+        mm_features=None,
+        block_hasher=request._block_hasher,
+    )
+    assert (
+        sched.cpu_coordinator.find_longest_cache_hit(
+            branch.block_hashes, branch.num_tokens - 1
+        )[1]
+        == 2 * BLOCK_SIZE
+    )
+
+    free_before = pool.get_num_free_blocks()
+    assert sched.get_num_new_matched_tokens(request, 4 * BLOCK_SIZE) == (0, False)
+    assert pool.get_num_free_blocks() == free_before
+    never_used = sum(
+        b.block_hash is None for b in pool.free_block_queue.get_all_free_blocks()
+    )
+    pool.get_new_blocks(never_used + 1)
+    assert sched.get_num_new_matched_tokens(branch, 0) == (2 * BLOCK_SIZE, True)
+
+
+@pytest.mark.parametrize("group", [0, 1])
+def test_cpu_state_refresh_respects_local_prefix_and_existing_pin(group: int) -> None:
     """Aliases preserve a concurrent pin; states beyond the GPU hit stay old."""
     fix = _make_hybrid_attention_mamba_scheduler(
         num_cpu_blocks=12,
+        attention_block_size=4 * BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
         dcp_world_size=1,
     )
@@ -2488,15 +2540,15 @@ def test_cpu_state_refresh_respects_local_prefix_and_existing_pin() -> None:
     pinned, outside, other = pool.get_new_blocks(3)
     for key in request.block_hashes[:2]:
         pool._insert_block_hash(
-            make_block_hash_with_group_id(key, 1), pinned, BLOCK_SIZE
+            make_block_hash_with_group_id(key, group), pinned, BLOCK_SIZE
         )
     pool._insert_block_hash(
-        make_block_hash_with_group_id(request.block_hashes[3], 1),
+        make_block_hash_with_group_id(request.block_hashes[3], group),
         outside,
         BLOCK_SIZE,
     )
     pool._insert_block_hash(
-        make_block_hash_with_group_id(b"x" * 32, 1), other, BLOCK_SIZE
+        make_block_hash_with_group_id(b"x" * 32, group), other, BLOCK_SIZE
     )
     pool.free_blocks([outside, other])
     before = pool.free_block_queue.get_all_free_blocks()
