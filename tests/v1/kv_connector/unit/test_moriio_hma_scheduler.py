@@ -657,12 +657,59 @@ def test_hybrid_write_notifies_grouped_slots_or_releases_a_complete_local_hit(
             block_notify_list=[[10], [1, 2, 3]],
             host="127.0.0.2",
             port=7000,
+            num_skip_blocks=0,
         )
         sched._send_transfer_release.assert_not_called()
     else:
         sched.send_notify_block.assert_not_called()
         sched._send_transfer_release.assert_called_once_with("tx", "127.0.0.2", 7000)
     assert not req.kv_transfer_params["do_remote_prefill"]
+
+
+@pytest.mark.parametrize(
+    "external_tokens,skip",
+    [
+        (40, 0),
+        (24, 1),
+        # A load trimmed to whole blocks still skips only the local hit.
+        (16, 1),
+        (8, 2),
+    ],
+)
+def test_plain_write_notify_skips_blocks_of_the_local_prefix_hit(
+    external_tokens, skip
+):
+    sched = _FakeScheduler(
+        mode=MoRIIOMode.WRITE,
+        _has_mamba=False,
+        block_size=16,
+        tp_size=1,
+        _is_kv_master=True,
+        request_id_to_transfer_id={},
+        transfer_id_to_request_id={},
+    )
+    sched.send_notify_block = Mock()
+    req = _mk_request(
+        list(range(40)),
+        params={
+            "do_remote_prefill": True,
+            "transfer_id": "tx",
+            "remote_host": "127.0.0.2",
+            "remote_notify_port": 7000,
+        },
+    )
+    req.request_id = "req"
+
+    sched.update_state_after_alloc(req, _FakeBlocks(([10, 11, 12],)), external_tokens)
+
+    sched.send_notify_block.assert_called_once_with(
+        req_id="req",
+        transfer_id="tx",
+        block_notify_list=[10, 11, 12],
+        host="127.0.0.2",
+        port=7000,
+        num_skip_blocks=skip,
+    )
 
 
 @pytest.mark.usefixtures("restore_moriio_role")
