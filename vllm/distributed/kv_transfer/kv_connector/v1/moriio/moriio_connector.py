@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import bisect
 import contextlib
 import logging
 import math
@@ -129,6 +130,8 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+_RDIAG_HIST_UB_S = (1e-3, 5e-3, 1e-2, 2e-2, 5e-2)
 
 # Backoff bounds for re-posting an RDMA READ that the NIC rejected because the
 # send queue was full. A separate CQ-poll thread drains completions, so the
@@ -1849,6 +1852,7 @@ class MoRIIOConnectorWorker:
         self._local_rank = get_world_group().local_rank
         self.tp_rank = self.moriio_config.tp_rank
         self.dp_rank = self.moriio_config.dp_rank
+        self._rdiag_reset(time.monotonic())
 
         self.local_ip = self.moriio_config.local_ip
         self.local_kv_port = self.moriio_config.local_kv_port
@@ -2882,6 +2886,7 @@ class MoRIIOConnectorWorker:
         heartbeat = getattr(self, "_heartbeat", None)
         if heartbeat is not None:
             heartbeat.check_health()
+        self._rdiag_maybe_log()
         done_sending, done_recving = set(), set()
 
         if self.is_producer:
@@ -3061,10 +3066,16 @@ class MoRIIOConnectorWorker:
         self._reads_issued_this_step = []
         if not statuses:
             return
+        t0 = time.perf_counter()
         try:
             self.moriio_wrapper.waiting_for_transfer_complete(
                 statuses, fail_fast=self._has_mamba
             )
+            dt = time.perf_counter() - t0
+            self._rdiag_steps += 1
+            self._rdiag_wait_s += dt
+            self._rdiag_wait_max = max(self._rdiag_wait_max, dt)
+            self._rdiag_hist[bisect.bisect_left(_RDIAG_HIST_UB_S, dt)] += 1
         except TransferError:
             in_flight = sum(not (s.Succeeded() or s.Failed()) for s in statuses)
             if in_flight:
@@ -3480,6 +3491,7 @@ class MoRIIOConnectorWorker:
             req_id,
         )
         chosen_tp, flexible = self._resolve_read_source(meta)
+        t0 = time.perf_counter()
         self._read_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,
@@ -3493,6 +3505,41 @@ class MoRIIOConnectorWorker:
             chosen_tp=chosen_tp,
             flexible=flexible,
         )
+        self._rdiag_post_s += time.perf_counter() - t0
+        self._rdiag_reqs += 1
+        self._rdiag_blocks += sum(len(g) for g in meta.local_block_ids)
+
+    def _rdiag_reset(self, now: float) -> None:
+        self._rdiag_t0 = now
+        self._rdiag_reqs = 0
+        self._rdiag_blocks = 0
+        self._rdiag_post_s = 0.0
+        self._rdiag_steps = 0
+        self._rdiag_wait_s = 0.0
+        self._rdiag_wait_max = 0.0
+        self._rdiag_hist = [0] * 6
+
+    def _rdiag_maybe_log(self) -> None:
+        now = time.monotonic()
+        win = now - self._rdiag_t0
+        if win < 30.0:
+            return
+        if self.tp_rank == 0 and self._rdiag_reqs:
+            logger.info(
+                "MoRIIO READ diag: win=%.1fs reqs=%d blocks=%d post_ms=%.1f "
+                "barrier_steps=%d barrier_ms=%.1f barrier_max_ms=%.1f "
+                "stall_frac=%.3f hist_le_1/5/10/20/50/inf=%s",
+                win,
+                self._rdiag_reqs,
+                self._rdiag_blocks,
+                self._rdiag_post_s * 1e3,
+                self._rdiag_steps,
+                self._rdiag_wait_s * 1e3,
+                self._rdiag_wait_max * 1e3,
+                (self._rdiag_post_s + self._rdiag_wait_s) / win,
+                "/".join(map(str, self._rdiag_hist)),
+            )
+        self._rdiag_reset(now)
 
     def _write_tp_mapping(self, remote_tp_size: int | None) -> MoRIIOWriteTPMapping:
         """Decode ranks this prefill rank writes, and what each receives."""
