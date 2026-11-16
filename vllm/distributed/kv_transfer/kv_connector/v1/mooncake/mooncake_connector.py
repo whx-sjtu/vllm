@@ -314,6 +314,53 @@ def _compute_sender_transfer_plan(
     )
 
 
+def _nvfp4_head_segments(
+    src_offset: int,
+    dst_offset: int,
+    length: int,
+    local_kv_block_len: int,
+    remote_kv_block_len: int,
+    local_num_heads: int,
+) -> list[tuple[int, int, int]]:
+    """Map a head-range copy planned on head-major pages onto NVFP4 pages.
+
+    Each side (K, then V) of an NVFP4 page stores every head's data before
+    every head's scales (see `nvfp4_split_data_scale`), so a head range is a
+    data run and a scale run per side instead of one contiguous slice.
+    Returns `(src_offset, dst_offset, length)` byte runs within a block.
+    """
+    head_bytes = local_kv_block_len // local_num_heads
+    side = head_bytes // 2
+    data, scale = side * 8 // 9, side // 9
+    assert local_num_heads * head_bytes == local_kv_block_len
+    assert remote_kv_block_len % head_bytes == 0 and data + scale == side
+    assert src_offset % head_bytes == dst_offset % head_bytes == 0
+    assert length % head_bytes == 0
+    remote_num_heads = remote_kv_block_len // head_bytes
+    src_head, dst_head = src_offset // head_bytes, dst_offset // head_bytes
+    num_heads = length // head_bytes
+    segments = []
+    for local_side, remote_side in (
+        (0, 0),
+        (local_num_heads * side, remote_num_heads * side),
+    ):
+        segments.append(
+            (
+                local_side + src_head * data,
+                remote_side + dst_head * data,
+                num_heads * data,
+            )
+        )
+        segments.append(
+            (
+                local_side + local_num_heads * data + src_head * scale,
+                remote_side + remote_num_heads * data + dst_head * scale,
+                num_heads * scale,
+            )
+        )
+    return segments
+
+
 def _can_coalesce_block_transfers(
     local_region_block_len: int,
     remote_region_block_len: int,
@@ -336,13 +383,14 @@ def _validate_asymmetric_region_lengths(
     local_tp_size: int,
     remote_tp_size: int,
     producer_cache_replicated: bool,
-    total_num_kv_heads: int | None = None,
+    total_num_kv_heads: int | list[int] | None = None,
 ) -> str | None:
     """Validate transfer-region metadata for a fixed producer/consumer pair.
 
     This checks registered KV regions, not per-request block counts. A region
     corresponds to one registered KV tensor, or one K/V half after expansion
-    for layouts that store K and V together.
+    for layouts that store K and V together. A list gives each region's own
+    KV-head count.
     """
     if len(local_regions) != len(remote_regions):
         return (
@@ -350,17 +398,23 @@ def _validate_asymmetric_region_lengths(
             "producer and consumer."
         )
 
-    if total_num_kv_heads is not None:
-        # TP ranks beyond the KV-head count replicate existing shards.
-        local_tp_size = min(local_tp_size, total_num_kv_heads)
-        remote_tp_size = min(remote_tp_size, total_num_kv_heads)
-    elif producer_cache_replicated:
-        return None
+    if total_num_kv_heads is None:
+        if producer_cache_replicated:
+            return None
+        region_heads: list[int | None] = [None] * len(local_regions)
+    elif isinstance(total_num_kv_heads, int):
+        region_heads = [total_num_kv_heads] * len(local_regions)
+    else:
+        region_heads = list(total_num_kv_heads)
 
-    tp_ratio = _get_tp_ratio(local_tp_size, remote_tp_size)
-    for idx, (local_region, remote_region) in enumerate(
-        zip(local_regions, remote_regions)
+    for idx, (local_region, remote_region, heads) in enumerate(
+        zip(local_regions, remote_regions, region_heads)
     ):
+        local_tp, remote_tp = local_tp_size, remote_tp_size
+        if heads is not None:
+            # TP ranks beyond the KV-head count replicate existing shards.
+            local_tp, remote_tp = min(local_tp, heads), min(remote_tp, heads)
+        tp_ratio = _get_tp_ratio(local_tp, remote_tp)
         if tp_ratio == 1:
             if local_region.kv_block_len != remote_region.kv_block_len:
                 return (
@@ -1818,7 +1872,10 @@ class MooncakeConnectorWorker:
             total_num_kv_heads=(
                 None
                 if self.use_mla or self.kv_cache_config.has_mamba_layers
-                else self.transfer_topo.total_num_kv_heads
+                else [
+                    self._region_total_kv_heads(region.layer_name)
+                    for region in local_regions
+                ]
             ),
         )
         if validation_err is not None:
@@ -2183,6 +2240,7 @@ class MooncakeConnectorWorker:
                     remote_kv_block_len=remote_region.kv_block_len,
                     remote_tp_rank=agent_meta.remote_tp_rank,
                     remote_tp_size=agent_meta.remote_tp_size,
+                    layer_name=local_region.layer_name,
                 )
                 if not should_transfer:
                     # Replicated KV cache: only one producer rank in the TP group
@@ -2198,6 +2256,29 @@ class MooncakeConnectorWorker:
                 assert dst_region_offset + transfer_len <= remote_region.kv_block_len, (
                     "Destination transfer region exceeds remote KV block size."
                 )
+                segments = self._nvfp4_transfer_segments(
+                    local_region,
+                    remote_region,
+                    src_region_offset,
+                    dst_region_offset,
+                    transfer_len,
+                )
+                if segments is not None:
+                    for src_offset, dst_offset, segment_len in segments:
+                        lengths.extend([segment_len] * len(local_ids))
+                        src_ptrs.extend(
+                            (
+                                local_ids * local_region.block_len
+                                + (local_region.base_addr + src_offset)
+                            ).tolist()
+                        )
+                        dst_ptrs.extend(
+                            (
+                                remote_ids * remote_region.block_len
+                                + (remote_region.base_addr + dst_offset)
+                            ).tolist()
+                        )
+                    continue
                 # Collapse one contiguous block group into a single larger
                 # transfer descriptor when the per-block copy is identical.
                 can_coalesce = _can_coalesce_block_transfers(
@@ -3269,11 +3350,56 @@ class MooncakeConnectorWorker:
                     "Mooncake KV-head re-sharding is not supported for padded "
                     f"KV pages (layer {region.layer_name})."
                 )
-            if spec.kv_quant_mode.is_nvfp4:
+            # Per side (K, V), NVFP4 slots hold every head's data, then every
+            # head's scales; other packings have no per-head runs.
+            if (
+                spec.kv_quant_mode.is_nvfp4
+                and not spec.kv_head_major_slots
+                and spec.num_head_slots not in (None, 2 * spec.num_kv_heads)
+            ):
                 return (
-                    "Mooncake KV-head re-sharding is not supported for NVFP4 KV cache."
+                    "Mooncake KV-head re-sharding is not supported for packed "
+                    f"NVFP4 KV pages (layer {region.layer_name})."
                 )
         return None
+
+    def _region_total_kv_heads(self, layer_name: str) -> int | None:
+        """KV heads a region shards across TP; None for an MLA or Mamba model."""
+        if self.use_mla or self.kv_cache_config.has_mamba_layers:
+            return None
+        # MLA-spec caches in a GQA model (e.g. a sparse indexer's key cache)
+        # are identical on every TP rank, like NIXL's REPLICATE regions.
+        if isinstance(
+            self._layer_specs.get(layer_name), (MLAAttentionSpec, SlidingWindowMLASpec)
+        ):
+            return 1
+        return self.transfer_topo.total_num_kv_heads
+
+    def _nvfp4_transfer_segments(
+        self,
+        local_region: TransferRegion,
+        remote_region: TransferRegion,
+        src_offset: int,
+        dst_offset: int,
+        length: int,
+    ) -> list[tuple[int, int, int]] | None:
+        """Byte runs of a partial-page copy of an NVFP4 page, else None."""
+        spec = self._layer_specs.get(local_region.layer_name)
+        if (
+            length == local_region.kv_block_len == remote_region.kv_block_len
+            or not isinstance(spec, AttentionSpec)
+            or not spec.kv_quant_mode.is_nvfp4
+            or spec.kv_head_major_slots
+        ):
+            return None
+        return _nvfp4_head_segments(
+            src_offset,
+            dst_offset,
+            length,
+            local_region.kv_block_len,
+            remote_region.kv_block_len,
+            spec.num_kv_heads,
+        )
 
     def _get_transfer_regions(
         self,
@@ -3308,7 +3434,9 @@ class MooncakeConnectorWorker:
         remote_kv_block_len: int,
         remote_tp_rank: int,
         remote_tp_size: int,
+        layer_name: str,
     ) -> tuple[bool, int, int, int]:
+        heads = self._region_total_kv_heads(layer_name)
         return _compute_sender_transfer_plan(
             local_tp_rank=self.tp_rank,
             local_tp_size=self.tp_size,
@@ -3316,12 +3444,12 @@ class MooncakeConnectorWorker:
             remote_tp_size=remote_tp_size,
             local_kv_block_len=local_kv_block_len,
             remote_kv_block_len=remote_kv_block_len,
-            producer_cache_replicated=self._producer_cache_is_replicated(),
-            total_num_kv_heads=(
-                None
-                if self.use_mla or self.kv_cache_config.has_mamba_layers
-                else self.transfer_topo.total_num_kv_heads
+            producer_cache_replicated=(
+                self._producer_cache_is_replicated()
+                if heads is None
+                else self.tp_size > heads
             ),
+            total_num_kv_heads=heads,
         )
 
     def _log_debug_cache_registration(

@@ -45,6 +45,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector im
     _contiguous_runs,
     _has_opaque_packed_row,
     _normalize_paired_block_order,
+    _nvfp4_head_segments,
     _pp_mismatch_hides_packed_layers,
     _validate_asymmetric_region_lengths,
     get_mooncake_bootstrap_addr,
@@ -59,6 +60,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheLayout,
+    KVQuantMode,
     MLAAttentionSpec,
 )
 from vllm.v1.request import RequestStatus
@@ -157,6 +159,130 @@ def test_region_length_validation_checks_replicated_gqa_heads(
         )
         is None
     ) == valid
+
+
+@pytest.mark.parametrize("local_tp,remote_tp", [(4, 1), (4, 2), (2, 1), (1, 4), (2, 4)])
+def test_nvfp4_head_segments_reshard_pages(local_tp, remote_tp):
+    """Re-sharded NVFP4 pages keep every head's data before every head's
+    scales on each side (K, then V)."""
+    num_heads, block_size = 4, 16
+    rng = np.random.default_rng(0)
+    # [side, head, bytes]: 64 data and 8 scale bytes per token for head_size 128.
+    data = rng.integers(0, 256, (2, num_heads, block_size * 64), dtype=np.uint8)
+    scale = rng.integers(0, 256, (2, num_heads, block_size * 8), dtype=np.uint8)
+
+    def heads(tp, rank):
+        n = num_heads // tp
+        return list(range(rank * n, (rank + 1) * n))
+
+    def page(head_ids):
+        return np.concatenate(
+            [np.concatenate([*data[s, head_ids], *scale[s, head_ids]]) for s in (0, 1)]
+        )
+
+    received = {r: np.zeros_like(page(heads(remote_tp, r))) for r in range(remote_tp)}
+    for local_rank in range(local_tp):
+        local_page = page(heads(local_tp, local_rank))
+        for remote_rank, dst_page in received.items():
+            if not set(heads(local_tp, local_rank)) & set(
+                heads(remote_tp, remote_rank)
+            ):
+                continue
+            should_send, src, dst, length = _compute_sender_transfer_plan(
+                local_tp_rank=local_rank,
+                local_tp_size=local_tp,
+                remote_tp_rank=remote_rank,
+                remote_tp_size=remote_tp,
+                local_kv_block_len=local_page.size,
+                remote_kv_block_len=dst_page.size,
+                producer_cache_replicated=False,
+                total_num_kv_heads=num_heads,
+            )
+            assert should_send
+            for s, d, n in _nvfp4_head_segments(
+                src, dst, length, local_page.size, dst_page.size, num_heads // local_tp
+            ):
+                dst_page[d : d + n] = local_page[s : s + n]
+    for remote_rank, dst_page in received.items():
+        np.testing.assert_array_equal(dst_page, page(heads(remote_tp, remote_rank)))
+
+
+def test_region_length_validation_per_region_kv_heads():
+    """A TP-replicated side cache keeps its length when the main KV re-shards."""
+    local = [
+        TransferRegion("attn", 0, 0, 18432, 18432),
+        TransferRegion("indexer", 0, 0, 9216, 9216),
+    ]
+    remote = [
+        TransferRegion("attn", 0, 0, 73728, 73728),
+        TransferRegion("indexer", 0, 0, 9216, 9216),
+    ]
+    kwargs = dict(local_tp_size=4, remote_tp_size=1, producer_cache_replicated=False)
+    assert (
+        _validate_asymmetric_region_lengths(
+            local, remote, total_num_kv_heads=[4, 1], **kwargs
+        )
+        is None
+    )
+    assert (
+        _validate_asymmetric_region_lengths(
+            local, remote, total_num_kv_heads=4, **kwargs
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize("tp_rank", range(4))
+def test_sender_plan_nvfp4_gqa_with_replicated_indexer_tp4_to_tp1(tp_rank):
+    """NVFP4 main KV re-shards per head; the MLA-spec indexer is sent once."""
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.async_zmq_ctx = MagicMock()
+    worker.tp_rank = tp_rank
+    worker.tp_size = 4
+    worker.use_mla = False
+    worker.kv_cache_config = _make_test_kv_cache_config()
+    worker.transfer_topo = SimpleNamespace(
+        local_replicates_kv_cache=False, total_num_kv_heads=4
+    )
+    worker._layer_specs = {
+        # K and V slots of packed data + block scales per head.
+        "attn": FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.uint8,
+            kv_quant_mode=KVQuantMode.NVFP4,
+            num_head_slots=2,
+            state_content_bytes=72,
+        ),
+        "indexer": MLAAttentionSpec(
+            block_size=128, num_kv_heads=1, head_size=72, dtype=torch.uint8
+        ),
+    }
+    assert worker._layer_specs["attn"].page_size_bytes == 18432
+    assert worker._layer_specs["indexer"].page_size_bytes == 9216
+    regions = [
+        TransferRegion("attn", 0, 0, 18432, 18432),
+        TransferRegion("indexer", 0, 0, 9216, 9216),
+    ]
+    assert worker._validate_head_resharding_layout(1, regions) is None
+
+    plan = worker._get_sender_transfer_plan(18432, 73728, 0, 1, "attn")
+    assert plan == (True, 0, tp_rank * 18432, 18432)
+    segments = worker._nvfp4_transfer_segments(
+        TransferRegion("attn", 0, 0, 18432, 18432),
+        TransferRegion("attn", 0, 0, 73728, 73728),
+        *plan[1:],
+    )
+    k_side, v_side = 0, 4 * 128 * 72
+    assert segments == [
+        (0, k_side + tp_rank * 8192, 8192),
+        (8192, k_side + 4 * 8192 + tp_rank * 1024, 1024),
+        (9216, v_side + tp_rank * 8192, 8192),
+        (9216 + 8192, v_side + 4 * 8192 + tp_rank * 1024, 1024),
+    ]
+    plan = worker._get_sender_transfer_plan(9216, 9216, 0, 1, "indexer")
+    assert plan == (tp_rank == 0, 0, 0, 9216)
 
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
@@ -351,6 +477,7 @@ async def test_build_transfer_params_separates_prefill_pp_layers():
     worker.use_mla = False
     worker.kv_cache_config = _make_test_kv_cache_config()
     worker._physical_blocks_per_logical_kv_block = 1
+    worker._layer_specs = {}
     worker.transfer_topo = SimpleNamespace(
         local_replicates_kv_cache=False,
         total_num_kv_heads=4,
@@ -2463,6 +2590,7 @@ async def test_build_transfer_params_sends_packed_region_once(
         num_blocks=4, num_groups=len(local_ids)
     )
     worker._physical_blocks_per_logical_kv_block = 1
+    worker._layer_specs = {}
     worker.transfer_topo = SimpleNamespace(
         local_replicates_kv_cache=False,
         total_num_kv_heads=1,
@@ -2549,6 +2677,7 @@ async def test_build_transfer_params_fragmented_block_ids(kv_block_len):
     worker.use_mla = False
     worker.kv_cache_config = _make_test_kv_cache_config()
     worker._physical_blocks_per_logical_kv_block = 1
+    worker._layer_specs = {}
     worker.transfer_topo = SimpleNamespace(
         local_replicates_kv_cache=False,
         total_num_kv_heads=4,
